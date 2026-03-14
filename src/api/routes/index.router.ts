@@ -140,11 +140,25 @@ if (metricsConfig.ENABLED) {
     lines.push('# TYPE evolution_instance_up gauge');
     lines.push('# HELP evolution_instance_state Instance state as a labelled metric');
     lines.push('# TYPE evolution_instance_state gauge');
+    lines.push('# HELP evolution_instance_functional_health Functional health as a labelled metric');
+    lines.push('# TYPE evolution_instance_functional_health gauge');
+    lines.push('# HELP evolution_instance_unresolved_updates_5m Unresolved message updates in the last 5 minutes');
+    lines.push('# TYPE evolution_instance_unresolved_updates_5m gauge');
+    lines.push('# HELP evolution_instance_session_errors_5m Session and decrypt errors in the last 5 minutes');
+    lines.push('# TYPE evolution_instance_session_errors_5m gauge');
+    lines.push('# HELP evolution_instance_last_valid_upsert_seconds Unix timestamp of the last valid messages.upsert');
+    lines.push('# TYPE evolution_instance_last_valid_upsert_seconds gauge');
+    lines.push(
+      '# HELP evolution_instance_last_healthy_connection_seconds Unix timestamp of the last healthy connection.update',
+    );
+    lines.push('# TYPE evolution_instance_last_healthy_connection_seconds gauge');
 
     for (const [name, instance] of instanceEntries) {
       const state = instance?.connectionStatus?.state || 'unknown';
       const integration = instance?.integration || '';
       const up = state === 'open' ? 1 : 0;
+      const functionalHealth =
+        typeof instance?.getFunctionalHealthMetrics === 'function' ? instance.getFunctionalHealthMetrics() : null;
 
       lines.push(
         `evolution_instance_up{instance="${escapeLabel(name)}",integration="${escapeLabel(integration)}"} ${up}`,
@@ -154,6 +168,38 @@ if (metricsConfig.ENABLED) {
           integration,
         )}",state="${escapeLabel(state)}"} 1`,
       );
+
+      if (functionalHealth) {
+        lines.push(
+          `evolution_instance_functional_health{instance="${escapeLabel(name)}",integration="${escapeLabel(
+            integration,
+          )}",status="${escapeLabel(functionalHealth.status)}"} 1`,
+        );
+        lines.push(
+          `evolution_instance_unresolved_updates_5m{instance="${escapeLabel(name)}",integration="${escapeLabel(
+            integration,
+          )}"} ${functionalHealth.unresolvedUpdates5m}`,
+        );
+        lines.push(
+          `evolution_instance_session_errors_5m{instance="${escapeLabel(name)}",integration="${escapeLabel(
+            integration,
+          )}"} ${functionalHealth.sessionErrors5m}`,
+        );
+        lines.push(
+          `evolution_instance_last_valid_upsert_seconds{instance="${escapeLabel(name)}",integration="${escapeLabel(
+            integration,
+          )}"} ${functionalHealth.lastValidUpsertAt ? Math.floor(functionalHealth.lastValidUpsertAt / 1000) : 0}`,
+        );
+        lines.push(
+          `evolution_instance_last_healthy_connection_seconds{instance="${escapeLabel(
+            name,
+          )}",integration="${escapeLabel(integration)}"} ${
+            functionalHealth.lastHealthyConnectionUpdateAt
+              ? Math.floor(functionalHealth.lastHealthyConnectionUpdateAt / 1000)
+              : 0
+          }`,
+        );
+      }
     }
 
     res.send(lines.join('\n') + '\n');

@@ -1,61 +1,52 @@
 import { Logger } from '@config/logger.config';
-import { BaileysEventMap, MessageUpsertType, WAMessage } from 'baileys';
-import { catchError, concatMap, delay, EMPTY, from, retryWhen, Subject, Subscription, take, tap } from 'rxjs';
+import { BaileysEventMap } from 'baileys';
+import { concatMap, from, Subject, Subscription } from 'rxjs';
 
-type MessageUpsertPayload = BaileysEventMap['messages.upsert'];
-type MountProps = {
-  onMessageReceive: (payload: MessageUpsertPayload, settings: any) => Promise<void>;
+type MessageEventName = 'messages.upsert' | 'messages.update';
+type ProcessorPayload = BaileysEventMap['messages.upsert'] | BaileysEventMap['messages.update'];
+
+type QueueItem = {
+  eventName: MessageEventName;
+  payload: ProcessorPayload;
+  settings: any;
+  resolve: () => void;
+  reject: (error: unknown) => void;
 };
+
+type MountProps = {
+  onEvent: (eventName: MessageEventName, payload: ProcessorPayload, settings: any) => Promise<void>;
+  onFinalError?: (eventName: MessageEventName, payload: ProcessorPayload, error: unknown) => Promise<void> | void;
+};
+
+export class UnreconciledMessageUpdateError extends Error {
+  constructor(
+    message: string,
+    public readonly metadata: Record<string, any> = {},
+  ) {
+    super(message);
+    this.name = 'UnreconciledMessageUpdateError';
+  }
+}
 
 export class BaileysMessageProcessor {
   private processorLogs = new Logger('BaileysMessageProcessor');
   private subscription?: Subscription;
+  private readonly retryDelaysMs = [1000, 3000, 10000];
 
-  protected messageSubject = new Subject<{
-    messages: WAMessage[];
-    type: MessageUpsertType;
-    requestId?: string;
-    settings: any;
-  }>();
+  protected messageSubject = new Subject<QueueItem>();
 
-  mount({ onMessageReceive }: MountProps) {
-    // Se já existe subscription, fazer cleanup primeiro
+  mount({ onEvent, onFinalError }: MountProps) {
     if (this.subscription && !this.subscription.closed) {
       this.subscription.unsubscribe();
     }
 
-    // Se o Subject foi completado, recriar
     if (this.messageSubject.closed) {
       this.processorLogs.warn('MessageSubject was closed, recreating...');
-      this.messageSubject = new Subject<{
-        messages: WAMessage[];
-        type: MessageUpsertType;
-        requestId?: string;
-        settings: any;
-      }>();
+      this.messageSubject = new Subject<QueueItem>();
     }
 
     this.subscription = this.messageSubject
-      .pipe(
-        tap(({ messages }) => {
-          this.processorLogs.log(`Processing batch of ${messages.length} messages`);
-        }),
-        concatMap(({ messages, type, requestId, settings }) =>
-          from(onMessageReceive({ messages, type, requestId }, settings)).pipe(
-            retryWhen((errors) =>
-              errors.pipe(
-                tap((error) => this.processorLogs.warn(`Retrying message batch due to error: ${error.message}`)),
-                delay(1000), // 1 segundo de delay
-                take(3), // Máximo 3 tentativas
-              ),
-            ),
-          ),
-        ),
-        catchError((error) => {
-          this.processorLogs.error(`Error processing message batch: ${error}`);
-          return EMPTY;
-        }),
-      )
+      .pipe(concatMap((item) => from(this.processQueueItem(item, onEvent, onFinalError))))
       .subscribe({
         error: (error) => {
           this.processorLogs.error(`Message stream error: ${error}`);
@@ -63,13 +54,84 @@ export class BaileysMessageProcessor {
       });
   }
 
-  processMessage(payload: MessageUpsertPayload, settings: any) {
-    const { messages, type, requestId } = payload;
-    this.messageSubject.next({ messages, type, requestId, settings });
+  public async processEvent(eventName: MessageEventName, payload: ProcessorPayload, settings: any) {
+    return await new Promise<void>((resolve, reject) => {
+      this.messageSubject.next({
+        eventName,
+        payload,
+        settings,
+        resolve,
+        reject,
+      });
+    });
   }
 
   onDestroy() {
     this.subscription?.unsubscribe();
     this.messageSubject.complete();
+  }
+
+  private async processQueueItem(
+    item: QueueItem,
+    onEvent: MountProps['onEvent'],
+    onFinalError?: MountProps['onFinalError'],
+  ) {
+    try {
+      await this.executeWithRetry(item, onEvent);
+      item.resolve();
+    } catch (error) {
+      this.processorLogs.error(
+        `Error processing ${item.eventName}: ${error instanceof Error ? error.message : String(error)}`,
+      );
+
+      if (onFinalError) {
+        await onFinalError(item.eventName, item.payload, error);
+      }
+
+      item.reject(error);
+    }
+  }
+
+  private async executeWithRetry(item: QueueItem, onEvent: MountProps['onEvent']) {
+    let genericAttempt = 0;
+    let unreconciledAttempt = 0;
+    const shouldRetry = true;
+
+    while (shouldRetry) {
+      try {
+        await onEvent(item.eventName, item.payload, item.settings);
+        return;
+      } catch (error) {
+        if (error instanceof UnreconciledMessageUpdateError) {
+          const retryDelay = this.retryDelaysMs[unreconciledAttempt];
+          if (retryDelay === undefined) {
+            throw error;
+          }
+
+          unreconciledAttempt++;
+          this.processorLogs.warn(
+            `Retrying ${item.eventName} after unresolved reconciliation (${unreconciledAttempt}/${this.retryDelaysMs.length})`,
+          );
+          await this.sleep(retryDelay);
+          continue;
+        }
+
+        if (genericAttempt >= 2) {
+          throw error;
+        }
+
+        genericAttempt++;
+        this.processorLogs.warn(
+          `Retrying ${item.eventName} due to generic error (${genericAttempt}/3): ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        );
+        await this.sleep(1000);
+      }
+    }
+  }
+
+  private async sleep(ms: number) {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

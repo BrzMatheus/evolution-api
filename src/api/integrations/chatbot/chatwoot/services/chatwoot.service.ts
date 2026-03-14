@@ -22,6 +22,7 @@ import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/reque
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
+import { getChatwootIdentifier, getChatwootPhoneNumber, getJidAliases, resolveCanonicalJid } from '@utils/whatsapp-jid';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
@@ -561,7 +562,12 @@ export class ChatwootService {
     const searchableFields = this.getSearchableFields();
 
     // eslint-disable-next-line prettier/prettier
-    if (contacts.length === 2 && this.getClientCwConfig().mergeBrazilContacts && query.startsWith('+55')) {
+    if (
+      contacts.length === 2 &&
+      this.getClientCwConfig().mergeBrazilContacts &&
+      query.startsWith('+55') &&
+      !query.includes('@')
+    ) {
       const contact = this.mergeBrazilianContacts(contacts);
       if (contact) {
         return contact;
@@ -629,20 +635,89 @@ export class ChatwootService {
     return filterPayload;
   }
 
+  private resolveWhatsappIdentity(body: any) {
+    const key = body?.key || {};
+    const resolved = resolveCanonicalJid(key);
+    const canonicalIdentifier = getChatwootIdentifier(key);
+    const phoneNumber = getChatwootPhoneNumber(key);
+
+    return {
+      ...resolved,
+      canonicalIdentifier,
+      phoneNumber,
+      aliases: getJidAliases(key),
+      isGroup: resolved.isGroup,
+    };
+  }
+
+  private getConversationCacheKey(instance: InstanceDto, identifier: string) {
+    return `${instance.instanceName}:createConversation-${identifier}`;
+  }
+
+  private getConversationLockKey(instance: InstanceDto, identifier: string) {
+    return `${instance.instanceName}:lock:createConversation-${identifier}`;
+  }
+
+  private async syncCanonicalIdentifier(
+    instance: InstanceDto,
+    identity: ReturnType<ChatwootService['resolveWhatsappIdentity']>,
+  ) {
+    if (!identity.canonicalIdentifier || !identity.phoneNumber || identity.isGroup || !identity.lidJid) {
+      return null;
+    }
+
+    const phoneDigits = identity.phoneNumber.split('@')[0].split(':')[0];
+    const canonicalContact = await this.findContactByIdentifier(instance, identity.canonicalIdentifier);
+    if (canonicalContact) {
+      return canonicalContact;
+    }
+
+    const phoneContact = await this.findContact(instance, phoneDigits);
+    if (!phoneContact || phoneContact.identifier === identity.canonicalIdentifier) {
+      return phoneContact;
+    }
+
+    this.logger.verbose(
+      `Identifier promotion detected: ${phoneContact.identifier} -> ${identity.canonicalIdentifier} (phone: ${identity.phoneNumber})`,
+    );
+
+    const updatedContact: any = await this.updateContact(instance, phoneContact.id, {
+      identifier: identity.canonicalIdentifier,
+      phone_number: `+${phoneDigits}`,
+    });
+
+    for (const alias of identity.aliases) {
+      await this.cache.delete(this.getConversationCacheKey(instance, alias));
+    }
+
+    if (updatedContact === null) {
+      const baseContact = await this.findContactByIdentifier(instance, identity.canonicalIdentifier);
+      if (baseContact && baseContact.id !== phoneContact.id) {
+        await this.mergeContacts(baseContact.id, phoneContact.id);
+        this.logger.verbose(
+          `Merge contacts after identifier promotion: (${baseContact.id}) ${baseContact.identifier} and (${phoneContact.id}) ${phoneContact.identifier}`,
+        );
+        return baseContact;
+      }
+    }
+
+    return updatedContact || phoneContact;
+  }
+
   public async createConversation(instance: InstanceDto, body: any) {
-    const isLid = body.key.addressingMode === 'lid';
-    const isGroup = body.key.remoteJid.endsWith('@g.us');
-    const phoneNumber = isLid && !isGroup ? body.key.remoteJidAlt : body.key.remoteJid;
-    const { remoteJid } = body.key;
-    const cacheKey = `${instance.instanceName}:createConversation-${remoteJid}`;
-    const lockKey = `${instance.instanceName}:lock:createConversation-${remoteJid}`;
+    const identity = this.resolveWhatsappIdentity(body);
+    const isGroup = identity.isGroup;
+    const phoneNumber = identity.phoneNumber || identity.canonicalIdentifier || body.key.remoteJid;
+    const remoteJid = identity.canonicalIdentifier || body.key.remoteJid;
+    const cacheKey = this.getConversationCacheKey(instance, remoteJid);
+    const lockKey = this.getConversationLockKey(instance, remoteJid);
     const maxWaitTime = 5000; // 5 seconds
     const client = await this.clientCw(instance);
     if (!client) return null;
 
     try {
       // Processa atualização de contatos já criados @lid
-      if (phoneNumber && remoteJid && !isGroup) {
+      if (!identity.canonicalIdentifier && phoneNumber && remoteJid && !isGroup) {
         const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
         if (contact && contact.identifier !== remoteJid) {
           this.logger.verbose(
@@ -670,7 +745,7 @@ export class ChatwootService {
       // If it already exists in the cache, return conversationId
       if (await this.cache.has(cacheKey)) {
         const conversationId = (await this.cache.get(cacheKey)) as number;
-        this.logger.verbose(`Found conversation to: ${phoneNumber}, conversation ID: ${conversationId}`);
+        this.logger.verbose(`Found conversation to: ${remoteJid}, conversation ID: ${conversationId}`);
         let conversationExists: any;
         try {
           conversationExists = await client.conversations.get({
@@ -733,7 +808,10 @@ export class ChatwootService {
           const group = await this.waMonitor.waInstances[instance.instanceName].client.groupMetadata(chatId);
           this.logger.verbose(`Group metadata: JID:${group.JID} - Subject:${group?.subject || group?.Name}`);
 
-          const participantJid = isLid && !body.key.fromMe ? body.key.participantAlt : body.key.participant;
+          const participantJid =
+            identity.lidJid && !body.key.fromMe && body.key.participantAlt
+              ? body.key.participantAlt
+              : body.key.participant;
           nameContact = `${group.subject} (GROUP)`;
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
@@ -769,8 +847,13 @@ export class ChatwootService {
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
-        this.logger.verbose(`Searching contact for: ${chatId}`);
-        let contact = await this.findContact(instance, chatId);
+        this.logger.verbose(`Searching contact for canonical identifier: ${remoteJid}`);
+        let contact = !isGroup ? await this.findContactByIdentifier(instance, remoteJid) : null;
+
+        if (!contact) {
+          this.logger.verbose(`Fallback to phone search for: ${chatId}`);
+          contact = await this.findContact(instance, chatId);
+        }
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
@@ -798,7 +881,7 @@ export class ChatwootService {
             isGroup,
             nameContact,
             picture_url.profilePictureUrl || null,
-            phoneNumber,
+            remoteJid,
           );
         }
 
@@ -1575,10 +1658,7 @@ export class ChatwootService {
             await this.prismaRepository.message.updateMany({
               where: {
                 instanceId: instance.instanceId,
-                key: {
-                  path: ['id'],
-                  equals: key.id,
-                },
+                keyId: key.id,
               },
               data: updateMessage,
             });
@@ -1642,15 +1722,20 @@ export class ChatwootService {
   }
 
   private async getMessageByKeyId(instance: InstanceDto, keyId: string): Promise<MessageModel> {
-    // Use raw SQL query to avoid JSON path issues with Prisma
-    const messages = await this.prismaRepository.$queryRaw`
-      SELECT * FROM "Message" 
-      WHERE "instanceId" = ${instance.instanceId} 
-      AND "key"->>'id' = ${keyId}
-      LIMIT 1
-    `;
-
-    return (messages as MessageModel[])[0] || null;
+    return await this.prismaRepository.message.findFirst({
+      where: {
+        instanceId: instance.instanceId,
+        OR: [
+          { keyId },
+          {
+            key: {
+              path: ['id'],
+              equals: keyId,
+            },
+          },
+        ],
+      },
+    });
   }
 
   private async getReplyToIds(
@@ -1963,6 +2048,15 @@ export class ChatwootService {
         return null;
       }
 
+      const identity = this.resolveWhatsappIdentity(body);
+      body.key = {
+        ...body.key,
+        canonicalJid: identity.canonicalJid,
+        phoneJid: identity.phoneJid,
+        lidJid: identity.lidJid,
+      };
+      const canonicalRemoteJid = identity.canonicalIdentifier || body?.key?.remoteJid;
+
       if (this.provider?.ignoreJids && this.provider?.ignoreJids.length > 0) {
         const ignoreJids: any = this.provider?.ignoreJids;
 
@@ -1977,25 +2071,25 @@ export class ChatwootService {
           ignoreContacts = true;
         }
 
-        if (ignoreGroups && body?.key?.remoteJid.endsWith('@g.us')) {
-          this.logger.warn('Ignoring message from group: ' + body?.key?.remoteJid);
+        if (ignoreGroups && canonicalRemoteJid?.endsWith('@g.us')) {
+          this.logger.warn('Ignoring message from group: ' + canonicalRemoteJid);
           return;
         }
 
-        if (ignoreContacts && body?.key?.remoteJid.endsWith('@s.whatsapp.net')) {
-          this.logger.warn('Ignoring message from contact: ' + body?.key?.remoteJid);
+        if (ignoreContacts && canonicalRemoteJid?.endsWith('@s.whatsapp.net')) {
+          this.logger.warn('Ignoring message from contact: ' + canonicalRemoteJid);
           return;
         }
 
-        if (ignoreJids.includes(body?.key?.remoteJid)) {
-          this.logger.warn('Ignoring message from jid: ' + body?.key?.remoteJid);
+        if (ignoreJids.includes(canonicalRemoteJid)) {
+          this.logger.warn('Ignoring message from jid: ' + canonicalRemoteJid);
           return;
         }
       }
 
       if (event === 'messages.upsert' || event === 'send.message') {
         this.logger.info(`[${event}] New message received - Instance: ${JSON.stringify(body, null, 2)}`);
-        if (body.key.remoteJid === 'status@broadcast') {
+        if (canonicalRemoteJid === 'status@broadcast') {
           return;
         }
 
@@ -2024,10 +2118,7 @@ export class ChatwootService {
         if (quotedId)
           quotedMsg = await this.prismaRepository.message.findFirst({
             where: {
-              key: {
-                path: ['id'],
-                equals: quotedId,
-              },
+              keyId: quotedId,
               chatwootMessageId: {
                 not: null,
               },
@@ -2336,10 +2427,7 @@ export class ChatwootService {
           if (message?.chatwootMessageId && message?.chatwootConversationId) {
             await this.prismaRepository.message.deleteMany({
               where: {
-                key: {
-                  path: ['id'],
-                  equals: body.key.id,
-                },
+                keyId: body.key.id,
                 instanceId: instance.instanceId,
               },
             });
@@ -2679,7 +2767,7 @@ export class ChatwootService {
         where: {
           Instance: { name: instance.instanceName },
           messageTimestamp: { gte: Number(dayjs().subtract(6, 'hours').unix()) },
-          AND: ids.map((id) => ({ key: { path: ['id'], not: id } })),
+          AND: ids.map((id) => ({ keyId: { not: id } })),
         },
       });
 
