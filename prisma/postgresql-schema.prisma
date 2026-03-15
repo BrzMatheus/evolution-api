@@ -60,6 +60,61 @@ enum DifyBotType {
   workflow
 }
 
+enum ChatwootHistoryScopeType {
+  single
+  selected
+  eligibleAll
+}
+
+enum ChatwootHistoryJobStatus {
+  pending
+  analyzing
+  awaiting_execution
+  running
+  completed
+  failed
+  partial
+}
+
+enum ChatwootHistoryJobMode {
+  dryRun
+  importDirect
+  rebuild
+}
+
+enum ChatwootHistoryClassification {
+  eligible
+  needs_review
+  lid_alias
+  requires_rebuild
+  ignored
+}
+
+enum ChatwootHistorySuggestedAction {
+  import_direct
+  create_rebuild
+  open_chatwoot
+  ignore
+}
+
+enum ChatwootHistoryExecutionStatus {
+  pending
+  completed
+  failed
+  skipped
+}
+
+enum ChatwootHistoryCanonicalIdentityType {
+  s_whatsapp_net
+  unresolved
+}
+
+enum ChatwootHistoryIdentityResolutionStatus {
+  resolved
+  alias_only
+  ambiguous
+}
+
 model Instance {
   id                      String                   @id @default(cuid())
   name                    String                   @unique @db.VarChar(255)
@@ -79,6 +134,8 @@ model Instance {
   updatedAt               DateTime?                @updatedAt @db.Timestamp
   Chat                    Chat[]
   Contact                 Contact[]
+  ChatwootHistoryJob      ChatwootHistoryJob[]
+  ChatwootHistoryContact  ChatwootHistoryJobContact[]
   Message                 Message[]
   Webhook                 Webhook?
   Chatwoot                Chatwoot?
@@ -248,6 +305,66 @@ model Chatwoot {
   updatedAt               DateTime  @updatedAt @db.Timestamp
   Instance                Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId              String    @unique
+}
+
+model ChatwootHistoryJob {
+  id          String                   @id @default(cuid())
+  scopeType   ChatwootHistoryScopeType
+  mode        ChatwootHistoryJobMode
+  jobStatus   ChatwootHistoryJobStatus @default(pending)
+  summary     Json?                    @db.JsonB
+  report      Json?                    @db.JsonB
+  filters     Json?                    @db.JsonB
+  errorMessage String?                 @db.Text
+  startedAt   DateTime?                @db.Timestamp
+  finishedAt  DateTime?                @db.Timestamp
+  createdAt   DateTime?                @default(now()) @db.Timestamp
+  updatedAt   DateTime                 @updatedAt @db.Timestamp
+  Contacts    ChatwootHistoryJobContact[]
+  Instance    Instance                 @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId  String
+
+  @@index([instanceId])
+  @@index([instanceId, jobStatus])
+  @@index([instanceId, createdAt])
+}
+
+model ChatwootHistoryJobContact {
+  id                       String                                  @id @default(cuid())
+  remoteJid                String                                  @db.VarChar(100)
+  canonicalJid             String?                                 @db.VarChar(100)
+  phoneJid                 String?                                 @db.VarChar(100)
+  lidJid                   String?                                 @db.VarChar(100)
+  canonicalIdentityType    ChatwootHistoryCanonicalIdentityType    @default(unresolved)
+  identityResolutionStatus ChatwootHistoryIdentityResolutionStatus @default(ambiguous)
+  pushName                 String?                                 @db.VarChar(255)
+  classification           ChatwootHistoryClassification
+  suggestedAction          ChatwootHistorySuggestedAction
+  selectedAction           ChatwootHistorySuggestedAction?
+  executionStatus          ChatwootHistoryExecutionStatus          @default(pending)
+  hasLidAlias              Boolean                                 @default(false) @db.Boolean
+  isSafeDirectImport       Boolean                                 @default(false) @db.Boolean
+  evolutionMessageCount    Int                                     @default(0) @db.Integer
+  chatwootMessageCount     Int                                     @default(0) @db.Integer
+  overlapCount             Int                                     @default(0) @db.Integer
+  chatwootContactId        Int?                                    @db.Integer
+  existingConversationId   Int?                                    @db.Integer
+  selectedConversationId   Int?                                    @db.Integer
+  rebuiltConversationId    Int?                                    @db.Integer
+  unsafeReasons            Json?                                   @db.JsonB
+  candidateConversationIds Json?                                   @db.JsonB
+  report                   Json?                                   @db.JsonB
+  createdAt                DateTime?                               @default(now()) @db.Timestamp
+  updatedAt                DateTime                                @updatedAt @db.Timestamp
+  Job                      ChatwootHistoryJob                      @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  jobId                    String
+  Instance                 Instance                                @relation(fields: [instanceId], references: [id], onDelete: Cascade)
+  instanceId               String
+
+  @@unique([jobId, remoteJid])
+  @@index([jobId])
+  @@index([instanceId])
+  @@index([instanceId, classification])
 }
 
 model Label {

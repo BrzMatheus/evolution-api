@@ -19,7 +19,9 @@ import { MetaController } from './integrations/channel/meta/meta.controller';
 import { BaileysController } from './integrations/channel/whatsapp/baileys.controller';
 import { ChatbotController } from './integrations/chatbot/chatbot.controller';
 import { ChatwootController } from './integrations/chatbot/chatwoot/controllers/chatwoot.controller';
+import { ChatwootHistoryController } from './integrations/chatbot/chatwoot/controllers/chatwoot-history.controller';
 import { ChatwootService } from './integrations/chatbot/chatwoot/services/chatwoot.service';
+import { ChatwootHistoryService } from './integrations/chatbot/chatwoot/services/chatwoot-history.service';
 import { DifyController } from './integrations/chatbot/dify/controllers/dify.controller';
 import { DifyService } from './integrations/chatbot/dify/services/dify.service';
 import { EvoaiController } from './integrations/chatbot/evoai/controllers/evoai.controller';
@@ -82,7 +84,9 @@ const proxyService = new ProxyService(waMonitor);
 export const proxyController = new ProxyController(proxyService, waMonitor);
 
 const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
+const chatwootHistoryService = new ChatwootHistoryService(prismaRepository, chatwootService);
 export const chatwootController = new ChatwootController(chatwootService, configService);
+export const chatwootHistoryController = new ChatwootHistoryController(chatwootHistoryService);
 
 const settingsService = new SettingsService(waMonitor);
 export const settingsController = new SettingsController(settingsService);

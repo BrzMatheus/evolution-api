@@ -13,7 +13,7 @@ type ChatwootUser = {
   user_id: number;
 };
 
-type FksChatwoot = {
+export type FksChatwoot = {
   phone_number: string;
   contact_id: string;
   conversation_id: string;
@@ -25,6 +25,27 @@ type firstLastTimestamp = {
 };
 
 type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.IWebMessageInfo, 'key'>>;
+
+type ImportHistoryOptions = {
+  allowedPhoneNumbers?: Set<string>;
+  forceFksByPhoneNumber?: Map<string, FksChatwoot>;
+};
+
+type NormalizedDirection = 'incoming' | 'outgoing';
+
+type MessageFingerprint = {
+  canonicalSourceId: string | null;
+  fallbackSignature: string | null;
+  token: string;
+};
+
+type ConversationInspectionResult = {
+  overlapCount: number;
+  matchedTokens: Set<string>;
+  matchedCanonicalSourceIds: Set<string>;
+  matchedFallbackSignatures: Set<string>;
+  sourceIdCollisionRisk: boolean;
+};
 
 class ChatwootImport {
   private logger = new Logger('ChatwootImport');
@@ -184,8 +205,14 @@ class ChatwootImport {
         return existingSourceIdsSet;
       }
 
-      // Ensure all sourceIds are consistently prefixed with 'WAID:' as required by downstream systems and database queries.
-      const formattedSourceIds = sourceIds.map((sourceId) => `WAID:${sourceId.replace('WAID:', '')}`);
+      const formattedSourceIds = Array.from(
+        new Set(
+          sourceIds
+            .map((sourceId) => this.normalizeSourceId(sourceId))
+            .filter(Boolean)
+            .map((sourceId) => sourceId.replace(/^wa:/, 'WAID:')),
+        ),
+      );
       const pgClient = postgresClient.getChatwootConnection();
 
       const params = conversationId ? [formattedSourceIds, conversationId] : [formattedSourceIds];
@@ -196,7 +223,10 @@ class ChatwootImport {
 
       const result = await pgClient.query(query, params);
       for (const row of result.rows) {
-        existingSourceIdsSet.add(row.source_id);
+        const normalizedSourceId = this.normalizeSourceId(row.source_id);
+        if (normalizedSourceId) {
+          existingSourceIdsSet.add(normalizedSourceId);
+        }
       }
 
       return existingSourceIdsSet;
@@ -211,6 +241,7 @@ class ChatwootImport {
     chatwootService: ChatwootService,
     inbox: inbox,
     provider: ChatwootModel,
+    options?: ImportHistoryOptions,
   ) {
     try {
       const pgClient = postgresClient.getChatwootConnection();
@@ -254,21 +285,40 @@ class ChatwootImport {
       });
 
       const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => !existingSourceIds.has(message.key.id));
+      messagesOrdered = messagesOrdered.filter((message: any) => {
+        const sourceId = this.normalizeSourceId(message?.key?.id);
+        return !sourceId || !existingSourceIds.has(sourceId);
+      });
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
       while (messagesChunk.length > 0) {
         // Map structure: +552199999999 => Message[]
-        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk);
+        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk, options?.allowedPhoneNumbers);
 
         if (messagesByPhoneNumber.size > 0) {
-          const fksByNumber = await this.selectOrCreateFksFromChatwoot(
-            provider,
-            inbox,
-            phoneNumbersWithTimestamp,
-            messagesByPhoneNumber,
+          const forcedPhoneNumbers = new Set(Array.from(options?.forceFksByPhoneNumber?.keys() || []));
+          const autoMessagesByPhoneNumber = new Map(
+            Array.from(messagesByPhoneNumber.entries()).filter(([phoneNumber]) => !forcedPhoneNumbers.has(phoneNumber)),
           );
+          const autoPhoneNumbersWithTimestamp = new Map(
+            Array.from(phoneNumbersWithTimestamp.entries()).filter(
+              ([phoneNumber]) => !forcedPhoneNumbers.has(phoneNumber),
+            ),
+          );
+
+          const fksByNumber = new Map<string, FksChatwoot>(options?.forceFksByPhoneNumber || []);
+
+          if (autoMessagesByPhoneNumber.size > 0) {
+            const autoFksByNumber = await this.selectOrCreateFksFromChatwoot(
+              provider,
+              inbox,
+              autoPhoneNumbersWithTimestamp,
+              autoMessagesByPhoneNumber,
+            );
+
+            autoFksByNumber.forEach((value, key) => fksByNumber.set(key, value));
+          }
 
           // inserting messages in chatwoot db
           let sqlInsertMsg = `INSERT INTO messages
@@ -276,19 +326,31 @@ class ChatwootImport {
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
           const bindInsertMsg = [provider.accountId, inbox.id];
 
-          messagesByPhoneNumber.forEach((messages: any[], phoneNumber: string) => {
+          for (const [phoneNumber, rawMessages] of messagesByPhoneNumber.entries()) {
             const fksChatwoot = fksByNumber.get(phoneNumber);
+            if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
+              continue;
+            }
 
-            messages.forEach((message) => {
+            const conversationMessages = await this.filterAlreadyImportedMessages(
+              instance,
+              chatwootService,
+              provider,
+              Number(fksChatwoot.conversation_id),
+              rawMessages,
+            );
+
+            conversationMessages.forEach((message) => {
+              const messageKey = (message.key || {}) as {
+                id?: string;
+                fromMe?: boolean;
+              };
+
               if (!message.message) {
                 return;
               }
 
-              if (!fksChatwoot?.conversation_id || !fksChatwoot?.contact_id) {
-                return;
-              }
-
-              const contentMessage = this.getContentMessage(chatwootService, message);
+              const contentMessage = this.getContentMessage(chatwootService, message as any);
               if (!contentMessage) {
                 return;
               }
@@ -299,16 +361,16 @@ class ChatwootImport {
               bindInsertMsg.push(fksChatwoot.conversation_id);
               const bindConversationId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(message.key.fromMe ? '1' : '0');
+              bindInsertMsg.push(messageKey.fromMe ? '1' : '0');
               const bindMessageType = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(message.key.fromMe ? chatwootUser.user_type : 'Contact');
+              bindInsertMsg.push(messageKey.fromMe ? chatwootUser.user_type : 'Contact');
               const bindSenderType = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(message.key.fromMe ? chatwootUser.user_id : fksChatwoot.contact_id);
+              bindInsertMsg.push(messageKey.fromMe ? chatwootUser.user_id : fksChatwoot.contact_id);
               const bindSenderId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push('WAID:' + message.key.id);
+              bindInsertMsg.push(this.toChatwootSourceId(messageKey.id));
               const bindSourceId = `$${bindInsertMsg.length}`;
 
               bindInsertMsg.push(message.messageTimestamp as number);
@@ -317,7 +379,7 @@ class ChatwootImport {
               sqlInsertMsg += `(${bindContent}, ${bindContent}, $1, $2, ${bindConversationId}, ${bindMessageType}, FALSE, 0,
                   ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
             });
-          });
+          }
           if (bindInsertMsg.length > 2) {
             if (sqlInsertMsg.slice(-1) === ',') {
               sqlInsertMsg = sqlInsertMsg.slice(0, -1);
@@ -453,7 +515,10 @@ class ChatwootImport {
     }
   }
 
-  public createMessagesMapByPhoneNumber(messages: Message[]): Map<string, Message[]> {
+  public createMessagesMapByPhoneNumber(
+    messages: Message[],
+    allowedPhoneNumbers?: Set<string>,
+  ): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
       const key = message?.key as {
         remoteJid: string;
@@ -462,6 +527,9 @@ class ChatwootImport {
         const phoneNumber = key?.remoteJid?.split('@')[0];
         if (phoneNumber) {
           const phoneNumberPlus = `+${phoneNumber}`;
+          if (allowedPhoneNumbers && !allowedPhoneNumbers.has(phoneNumberPlus)) {
+            return acc;
+          }
           const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
           messages.push(message);
           acc.set(phoneNumberPlus, messages);
@@ -572,7 +640,222 @@ class ChatwootImport {
 
     const sql = `UPDATE messages SET source_id = $1, status = 0, created_at = NOW(), updated_at = NOW() WHERE id = $2;`;
 
-    return pgClient.query(sql, [`WAID:${sourceId}`, messageId]);
+    return pgClient.query(sql, [this.toChatwootSourceId(sourceId), messageId]);
+  }
+
+  public normalizeSourceId(sourceId: string | null | undefined) {
+    if (!sourceId) {
+      return null;
+    }
+
+    const normalized = String(sourceId).trim();
+    if (!normalized) {
+      return null;
+    }
+
+    return `wa:${normalized
+      .replace(/^WAID:/i, '')
+      .replace(/^evo:wa:/i, '')
+      .replace(/^wa:/i, '')}`;
+  }
+
+  public toChatwootSourceId(sourceId: string | null | undefined) {
+    const normalized = this.normalizeSourceId(sourceId);
+    if (!normalized) {
+      return null;
+    }
+
+    return normalized.replace(/^wa:/, 'WAID:');
+  }
+
+  public normalizeContent(content: string | null | undefined) {
+    return String(content || '')
+      .trim()
+      .replace(/\s+/g, ' ')
+      .toLowerCase();
+  }
+
+  public buildFallbackSignature(
+    createdAtEpoch: number | null | undefined,
+    direction: NormalizedDirection,
+    content: string | null | undefined,
+  ) {
+    if (!createdAtEpoch) {
+      return null;
+    }
+
+    return `${createdAtEpoch}:${direction}:${this.normalizeContent(content)}`;
+  }
+
+  public buildMessageFingerprint(chatwootService: ChatwootService, message: Message): MessageFingerprint {
+    const messageKey = (message.key || {}) as {
+      id?: string;
+      fromMe?: boolean;
+    };
+    const content = this.getContentMessage(chatwootService, message as any);
+    const canonicalSourceId = this.normalizeSourceId(messageKey.id || message.keyId);
+    const fallbackSignature = this.buildFallbackSignature(
+      Number(message.messageTimestamp || 0),
+      messageKey.fromMe ? 'outgoing' : 'incoming',
+      content,
+    );
+
+    return {
+      canonicalSourceId,
+      fallbackSignature,
+      token: canonicalSourceId ? `source:${canonicalSourceId}` : `fallback:${fallbackSignature || 'unknown'}`,
+    };
+  }
+
+  public async inspectConversationMessages(
+    instance: InstanceDto,
+    chatwootService: ChatwootService,
+    provider: ChatwootModel,
+    conversationId: number,
+    messages: Message[],
+  ): Promise<ConversationInspectionResult> {
+    const fingerprints = messages.map((message) => this.buildMessageFingerprint(chatwootService, message));
+    const canonicalSourceIds = Array.from(
+      new Set(fingerprints.map((fingerprint) => fingerprint.canonicalSourceId).filter(Boolean)),
+    ) as string[];
+    const timestamps = messages
+      .map((message) => Number(message.messageTimestamp || 0))
+      .filter((timestamp) => Number.isFinite(timestamp) && timestamp > 0);
+
+    if (fingerprints.length === 0 || timestamps.length === 0) {
+      return {
+        overlapCount: 0,
+        matchedTokens: new Set<string>(),
+        matchedCanonicalSourceIds: new Set<string>(),
+        matchedFallbackSignatures: new Set<string>(),
+        sourceIdCollisionRisk: false,
+      };
+    }
+
+    const sourceToFallbackMap = new Map<string, Set<string>>();
+    fingerprints.forEach((fingerprint) => {
+      if (!fingerprint.canonicalSourceId || !fingerprint.fallbackSignature) {
+        return;
+      }
+
+      const values = sourceToFallbackMap.get(fingerprint.canonicalSourceId) || new Set<string>();
+      values.add(fingerprint.fallbackSignature);
+      sourceToFallbackMap.set(fingerprint.canonicalSourceId, values);
+    });
+
+    const pgClient = postgresClient.getChatwootConnection();
+    const minTimestamp = Math.min(...timestamps) - 86400;
+    const maxTimestamp = Math.max(...timestamps) + 86400;
+    const rows =
+      (
+        await pgClient.query(
+          `SELECT source_id, created_at, message_type, content, processed_message_content
+           FROM messages
+          WHERE account_id = $1
+            AND conversation_id = $2
+            AND (
+              source_id = ANY($3)
+              OR created_at BETWEEN to_timestamp($4) AND to_timestamp($5)
+            )`,
+          [
+            provider.accountId,
+            conversationId,
+            canonicalSourceIds.map((sourceId) => sourceId.replace(/^wa:/, 'WAID:')),
+            minTimestamp,
+            maxTimestamp,
+          ],
+        )
+      )?.rows || [];
+
+    const matchedTokens = new Set<string>();
+    const matchedCanonicalSourceIds = new Set<string>();
+    const matchedFallbackSignatures = new Set<string>();
+    let sourceIdCollisionRisk = Array.from(sourceToFallbackMap.values()).some((values) => values.size > 1);
+
+    const existingFallbackBySource = new Map<string, Set<string>>();
+    const existingFallbackSignatures = new Set<string>();
+    rows.forEach((row) => {
+      const canonicalSourceId = this.normalizeSourceId(row.source_id);
+      const fallbackSignature = this.buildFallbackSignature(
+        row.created_at ? Math.floor(new Date(row.created_at).getTime() / 1000) : null,
+        this.normalizeDirection(row.message_type),
+        row.processed_message_content || row.content,
+      );
+
+      if (canonicalSourceId) {
+        const values = existingFallbackBySource.get(canonicalSourceId) || new Set<string>();
+        if (fallbackSignature) {
+          values.add(fallbackSignature);
+        }
+        existingFallbackBySource.set(canonicalSourceId, values);
+      }
+
+      if (fallbackSignature) {
+        existingFallbackSignatures.add(fallbackSignature);
+      }
+    });
+
+    fingerprints.forEach((fingerprint) => {
+      const sourceFallbacks =
+        fingerprint.canonicalSourceId && fingerprint.fallbackSignature
+          ? existingFallbackBySource.get(fingerprint.canonicalSourceId)
+          : null;
+
+      if (fingerprint.canonicalSourceId && sourceFallbacks) {
+        matchedCanonicalSourceIds.add(fingerprint.canonicalSourceId);
+        matchedTokens.add(fingerprint.token);
+
+        if (
+          fingerprint.fallbackSignature &&
+          sourceFallbacks.size > 0 &&
+          !sourceFallbacks.has(fingerprint.fallbackSignature)
+        ) {
+          sourceIdCollisionRisk = true;
+        }
+      }
+
+      if (fingerprint.fallbackSignature && existingFallbackSignatures.has(fingerprint.fallbackSignature)) {
+        matchedFallbackSignatures.add(fingerprint.fallbackSignature);
+        matchedTokens.add(fingerprint.token);
+      }
+    });
+
+    return {
+      overlapCount: matchedTokens.size,
+      matchedTokens,
+      matchedCanonicalSourceIds,
+      matchedFallbackSignatures,
+      sourceIdCollisionRisk,
+    };
+  }
+
+  public async filterAlreadyImportedMessages(
+    instance: InstanceDto,
+    chatwootService: ChatwootService,
+    provider: ChatwootModel,
+    conversationId: number,
+    messages: Message[],
+  ) {
+    const inspection = await this.inspectConversationMessages(
+      instance,
+      chatwootService,
+      provider,
+      conversationId,
+      messages,
+    );
+
+    if (inspection.matchedTokens.size === 0) {
+      return messages;
+    }
+
+    return messages.filter((message) => {
+      const fingerprint = this.buildMessageFingerprint(chatwootService, message);
+      return !inspection.matchedTokens.has(fingerprint.token);
+    });
+  }
+
+  private normalizeDirection(messageType: unknown): NormalizedDirection {
+    return String(messageType) === '1' || String(messageType) === 'outgoing' ? 'outgoing' : 'incoming';
   }
 }
 

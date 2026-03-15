@@ -59,7 +59,7 @@ export class ChatwootService {
 
   private pgClient = postgresClient.getChatwootConnection();
 
-  private async getProvider(instance: InstanceDto): Promise<ChatwootModel | null> {
+  public async getProvider(instance: InstanceDto): Promise<ChatwootModel | null> {
     const cacheKey = `${instance.instanceName}:getProvider`;
     if (await this.cache.has(cacheKey)) {
       const provider = (await this.cache.get(cacheKey)) as ChatwootModel;
@@ -1077,6 +1077,112 @@ export class ChatwootService {
         (conversation) => conversation.inbox_id === inbox.id && conversation.status === 'open',
       ) || undefined
     );
+  }
+
+  public async listContactConversations(instance: InstanceDto, contactId: number): Promise<conversation[]> {
+    const client = await this.clientCw(instance);
+
+    if (!client) {
+      this.logger.warn('client not found');
+      return [];
+    }
+
+    const conversations = (await client.contacts.listConversations({
+      accountId: this.provider.accountId,
+      id: contactId,
+    })) as any;
+
+    return Array.isArray(conversations?.payload) ? conversations.payload : [];
+  }
+
+  public async getLatestInboxConversation(
+    instance: InstanceDto,
+    contactId: number,
+    inboxId: number,
+  ): Promise<conversation | null> {
+    const conversations = await this.listContactConversations(instance, contactId);
+    const inboxConversations = conversations
+      .filter((item) => item?.inbox_id === inboxId)
+      .sort((left, right) => (right?.id || 0) - (left?.id || 0));
+
+    return inboxConversations[0] || null;
+  }
+
+  public async createFreshConversation(
+    instance: InstanceDto,
+    contactId: number,
+    inboxId: number,
+    pending = false,
+  ): Promise<conversation | null> {
+    const client = await this.clientCw(instance);
+
+    if (!client) {
+      this.logger.warn('client not found');
+      return null;
+    }
+
+    const data: Record<string, string> = {
+      contact_id: contactId.toString(),
+      inbox_id: inboxId.toString(),
+    };
+
+    if (pending) {
+      data.status = 'pending';
+    }
+
+    const freshConversation = await client.conversations.create({
+      accountId: this.provider.accountId,
+      data,
+    });
+
+    if (!freshConversation) {
+      this.logger.warn('conversation not created');
+      return null;
+    }
+
+    return freshConversation as unknown as conversation;
+  }
+
+  public async countConversationMessages(instance: InstanceDto, conversationId: number): Promise<number> {
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      return 0;
+    }
+
+    const result = await this.pgClient.query(
+      'SELECT COUNT(*)::INTEGER as total FROM messages WHERE account_id = $1 AND conversation_id = $2',
+      [provider.accountId, conversationId],
+    );
+
+    return Number(result?.rows?.[0]?.total || 0);
+  }
+
+  public async getConversationMessageWindow(
+    instance: InstanceDto,
+    conversationId: number,
+  ): Promise<{ firstMessageAt: string | null; lastMessageAt: string | null }> {
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      return {
+        firstMessageAt: null,
+        lastMessageAt: null,
+      };
+    }
+
+    const result = await this.pgClient.query(
+      `SELECT
+          MIN(created_at) AS "firstMessageAt",
+          MAX(created_at) AS "lastMessageAt"
+         FROM messages
+        WHERE account_id = $1
+          AND conversation_id = $2`,
+      [provider.accountId, conversationId],
+    );
+
+    return {
+      firstMessageAt: result?.rows?.[0]?.firstMessageAt ? new Date(result.rows[0].firstMessageAt).toISOString() : null,
+      lastMessageAt: result?.rows?.[0]?.lastMessageAt ? new Date(result.rows[0].lastMessageAt).toISOString() : null,
+    };
   }
 
   public async createBotMessage(

@@ -2587,26 +2587,10 @@ export class BaileysStartupService extends ChannelStartupService {
     });
   }
 
+  // eslint-disable-next-line @typescript-eslint/no-unused-vars -- signature required by shouldSyncHistoryMessage callback
   private historySyncNotification(msg: proto.Message.IHistorySyncNotification) {
-    const instance: InstanceDto = { instanceName: this.instance.name };
-
-    if (
-      this.configService.get<Chatwoot>('CHATWOOT').ENABLED &&
-      this.localChatwoot?.enabled &&
-      this.localChatwoot.importMessages &&
-      this.isSyncNotificationFromUsedSyncType(msg)
-    ) {
-      if (msg.chunkOrder === 1) {
-        this.chatwootService.startImportHistoryMessages(instance);
-      }
-
-      if (msg.progress === 100) {
-        setTimeout(() => {
-          this.chatwootService.importHistoryMessages(instance);
-        }, 10000);
-      }
-    }
-
+    // Chatwoot history import is manual-first in v1. We still keep the local WhatsApp history sync,
+    // but the operator must trigger Chatwoot analysis/import explicitly through the new job pipeline.
     return true;
   }
 
