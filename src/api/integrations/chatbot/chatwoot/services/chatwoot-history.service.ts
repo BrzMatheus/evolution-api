@@ -878,15 +878,35 @@ export class ChatwootHistoryService {
     remoteJid: string,
     resolved: ReturnType<typeof resolveCanonicalJid>,
   ) {
-    const aliasConditions = [
-      resolved.canonicalJid ? { canonicalJid: resolved.canonicalJid } : null,
-      resolved.phoneJid ? { phoneJid: resolved.phoneJid } : null,
-      resolved.lidJid ? { lidJid: resolved.lidJid } : null,
-    ].filter(Boolean);
+    const aliases = getJidAliases({
+      remoteJid,
+      canonicalJid: resolved.canonicalJid,
+      phoneJid: resolved.phoneJid,
+      lidJid: resolved.lidJid,
+    });
+
+    const aliasConditions = aliases.flatMap((alias) => [
+      { canonicalJid: alias },
+      { phoneJid: alias },
+      { lidJid: alias },
+      { key: { path: ['canonicalJid'], equals: alias } },
+      { key: { path: ['remoteJid'], equals: alias } },
+      { key: { path: ['remoteJidAlt'], equals: alias } },
+    ]);
 
     if (aliasConditions.length === 0) {
       return this.prismaRepository.message.findMany({
-        where: { instanceId: instance.instanceId, canonicalJid: remoteJid },
+        where: {
+          instanceId: instance.instanceId,
+          OR: [
+            { canonicalJid: remoteJid },
+            { phoneJid: remoteJid },
+            { lidJid: remoteJid },
+            { key: { path: ['canonicalJid'], equals: remoteJid } },
+            { key: { path: ['remoteJid'], equals: remoteJid } },
+            { key: { path: ['remoteJidAlt'], equals: remoteJid } },
+          ],
+        },
         orderBy: { messageTimestamp: 'asc' },
       });
     }
