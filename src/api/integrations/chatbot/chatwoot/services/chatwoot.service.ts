@@ -2034,6 +2034,11 @@ export class ChatwootService {
 
   public async eventWhatsapp(event: string, instance: InstanceDto, body: any) {
     try {
+      body = {
+        ...body,
+        key: body?.key ? { ...body.key } : undefined,
+      };
+
       const waInstance = this.waMonitor.waInstances[instance.instanceName];
 
       if (!waInstance) {

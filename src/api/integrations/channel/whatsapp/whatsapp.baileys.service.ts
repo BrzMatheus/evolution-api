@@ -900,6 +900,20 @@ export class BaileysStartupService extends ChannelStartupService {
     await this.baileysCache.set(this.getProtocolCacheKey(aliasKeyId), originalKeyId, this.MESSAGE_IDENTITY_TTL_SECONDS);
   }
 
+  private sanitizeContactPayload(contact: {
+    remoteJid: string;
+    pushName?: string;
+    profilePicUrl?: string;
+    instanceId: string;
+  }) {
+    return {
+      remoteJid: contact.remoteJid,
+      pushName: contact.pushName,
+      profilePicUrl: contact.profilePicUrl,
+      instanceId: contact.instanceId,
+    };
+  }
+
   private async createMessageRecord(messageRaw: any) {
     const data = this.enrichMessageData(messageRaw);
     const message = await this.prismaRepository.message.create({ data });
@@ -1437,8 +1451,8 @@ export class BaileysStartupService extends ChannelStartupService {
         const updateTransactions = contactsRaw.map((contact) =>
           this.prismaRepository.contact.upsert({
             where: { remoteJid_instanceId: { remoteJid: contact.remoteJid, instanceId: contact.instanceId } },
-            create: contact,
-            update: contact,
+            create: this.sanitizeContactPayload(contact),
+            update: this.sanitizeContactPayload(contact),
           }),
         );
         await this.prismaRepository.$transaction(updateTransactions);
@@ -2061,6 +2075,7 @@ export class BaileysStartupService extends ChannelStartupService {
           }
 
           if (contact) {
+            const contactPersistence = this.sanitizeContactPayload(contactRaw);
             this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
 
             if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
@@ -2073,21 +2088,32 @@ export class BaileysStartupService extends ChannelStartupService {
 
             if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
               await this.prismaRepository.contact.upsert({
-                where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-                create: contactRaw,
-                update: contactRaw,
+                where: {
+                  remoteJid_instanceId: {
+                    remoteJid: contactPersistence.remoteJid,
+                    instanceId: contactPersistence.instanceId,
+                  },
+                },
+                create: contactPersistence,
+                update: contactPersistence,
               });
 
             continue;
           }
 
+          const contactPersistence = this.sanitizeContactPayload(contactRaw);
           this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
           if (this.configService.get<Database>('DATABASE').SAVE_DATA.CONTACTS)
             await this.prismaRepository.contact.upsert({
-              where: { remoteJid_instanceId: { remoteJid: contactRaw.remoteJid, instanceId: contactRaw.instanceId } },
-              update: contactRaw,
-              create: contactRaw,
+              where: {
+                remoteJid_instanceId: {
+                  remoteJid: contactPersistence.remoteJid,
+                  instanceId: contactPersistence.instanceId,
+                },
+              },
+              update: contactPersistence,
+              create: contactPersistence,
             });
         }
       } catch (error) {
