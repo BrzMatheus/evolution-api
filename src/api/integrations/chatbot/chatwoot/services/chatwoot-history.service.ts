@@ -149,6 +149,10 @@ type JobReportOptions = {
   finishedAt?: string | null;
 };
 
+type ExecuteRuntimeOptions = {
+  allowUnsafeOverrideRemoteJids?: Set<string>;
+};
+
 export class ChatwootHistoryService {
   private readonly logger = new Logger('ChatwootHistoryService');
 
@@ -247,7 +251,11 @@ export class ChatwootHistoryService {
     }
   }
 
-  public async execute(instance: InstanceDto, data: ChatwootHistoryExecuteDto) {
+  public async execute(
+    instance: InstanceDto,
+    data: ChatwootHistoryExecuteDto,
+    runtimeOptions: ExecuteRuntimeOptions = {},
+  ) {
     const scopedInstance = await this.resolveInstanceScope(instance);
     const sourceJob = await this.requireJob(scopedInstance, data.jobId);
     const sourceContacts = await this.prismaRepository.chatwootHistoryJobContact.findMany({
@@ -311,7 +319,9 @@ export class ChatwootHistoryService {
 
       const results: PersistedContactRow[] = [];
       for (const contact of executionContacts) {
-        const updated = await this.executeContact(scopedInstance, context, data.mode, contact);
+        const updated = await this.executeContact(scopedInstance, context, data.mode, contact, {
+          allowUnsafeOverride: !!runtimeOptions.allowUnsafeOverrideRemoteJids?.has(contact.remoteJid),
+        });
         results.push(this.mapExecutionContact(updated));
       }
 
@@ -480,12 +490,20 @@ export class ChatwootHistoryService {
       return this.getJob(scopedInstance, job.id);
     }
 
-    return this.execute(scopedInstance, {
-      jobId: job.id,
-      mode: data.action === 'createRebuild' ? 'rebuild' : 'importDirect',
-      selectionMode: 'selected',
-      remoteJids: [contact.remoteJid],
-    });
+    return this.execute(
+      scopedInstance,
+      {
+        jobId: job.id,
+        mode: data.action === 'createRebuild' ? 'rebuild' : 'importDirect',
+        selectionMode: 'selected',
+        remoteJids: [contact.remoteJid],
+      },
+      data.action === 'importDirect'
+        ? {
+            allowUnsafeOverrideRemoteJids: new Set([contact.remoteJid]),
+          }
+        : {},
+    );
   }
 
   public async exportCsv(instance: InstanceDto, jobId: string) {
@@ -1021,9 +1039,14 @@ export class ChatwootHistoryService {
     context: HistoryAnalysisContext,
     mode: Exclude<JobMode, 'dryRun'>,
     contact: any,
+    options?: {
+      allowUnsafeOverride?: boolean;
+    },
   ) {
     const selectedAction = mode === 'rebuild' ? 'create_rebuild' : 'import_direct';
-    if (!this.isSafeForMode(contact, mode)) {
+    const isSafeForMode = this.isSafeForMode(contact, mode);
+    const allowUnsafeOverride = !!options?.allowUnsafeOverride;
+    if (!isSafeForMode && !allowUnsafeOverride) {
       return this.updateExecutionContact(contact.id, {
         selectedAction,
         executionStatus: 'skipped',
@@ -1151,6 +1174,10 @@ export class ChatwootHistoryService {
             executionError: null,
             rebuiltConversationId,
             reviewPayload,
+            executionWarning:
+              !isSafeForMode && allowUnsafeOverride
+                ? 'Explicit manual override executed despite direct import safety warnings'
+                : null,
           }),
         ),
       });
@@ -1542,6 +1569,7 @@ export class ChatwootHistoryService {
       executionError: string | null;
       rebuiltConversationId: number | null;
       reviewPayload: ChatwootReviewPayload;
+      executionWarning?: string | null;
     },
   ) {
     const existingDecision = this.asObject(report.decision);
@@ -1558,6 +1586,7 @@ export class ChatwootHistoryService {
         ...execution,
         status: args.executionStatus,
         error: args.executionError,
+        warning: args.executionWarning || execution.warning || null,
         finishedAt: new Date().toISOString(),
       },
       review: args.reviewPayload,
