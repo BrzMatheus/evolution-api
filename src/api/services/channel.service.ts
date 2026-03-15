@@ -337,6 +337,7 @@ export class ChannelStartupService {
     const ignoreJidsArray = Array.isArray(data.ignoreJids) ? data.ignoreJids.map((event) => String(event)) : [];
 
     return {
+      instanceId: data.instanceId,
       enabled: data?.enabled,
       accountId: data.accountId,
       token: data.token,

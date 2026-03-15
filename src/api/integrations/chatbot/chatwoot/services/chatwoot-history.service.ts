@@ -634,7 +634,8 @@ export class ChatwootHistoryService {
     validations.push({
       code: 'chatwoot_mapping_unique_for_instance',
       label: 'Mapping unico por instancia',
-      ok: !!provider?.instanceId,
+      ok: !!provider,
+      details: provider ? undefined : 'Nenhuma configuracao persistida do Chatwoot foi encontrada para esta instancia.',
     });
     validations.push({
       code: 'chatwoot_inbox_resolved',
