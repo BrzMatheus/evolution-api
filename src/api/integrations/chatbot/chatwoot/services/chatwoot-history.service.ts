@@ -158,19 +158,21 @@ export class ChatwootHistoryService {
   ) {}
 
   public async getInboxStatus(instance: InstanceDto) {
-    const { inboxStatus } = await this.loadInboxContext(instance);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const { inboxStatus } = await this.loadInboxContext(scopedInstance);
 
     return inboxStatus;
   }
 
   public async analyze(instance: InstanceDto, data: ChatwootHistoryAnalyzeDto) {
-    const context = await this.requireAnalysisContext(instance);
-    const remoteJids = await this.resolveScopeRemoteJids(instance, data);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const context = await this.requireAnalysisContext(scopedInstance);
+    const remoteJids = await this.resolveScopeRemoteJids(scopedInstance, data);
     const startedAt = new Date();
 
     const job = await this.prismaRepository.chatwootHistoryJob.create({
       data: {
-        instanceId: instance.instanceId,
+        instanceId: scopedInstance.instanceId,
         scopeType: data.scopeType,
         mode: 'dryRun',
         jobStatus: 'analyzing',
@@ -199,12 +201,12 @@ export class ChatwootHistoryService {
       const analyses: ContactAnalysis[] = [];
 
       for (const remoteJid of remoteJids) {
-        analyses.push(await this.analyzeContact(instance, remoteJid, context));
+        analyses.push(await this.analyzeContact(scopedInstance, remoteJid, context));
       }
 
       if (analyses.length > 0) {
         await this.prismaRepository.chatwootHistoryJobContact.createMany({
-          data: analyses.map((analysis) => this.toHistoryJobContactCreate(job.id, instance.instanceId, analysis)),
+          data: analyses.map((analysis) => this.toHistoryJobContactCreate(job.id, scopedInstance.instanceId, analysis)),
         });
       }
 
@@ -230,7 +232,7 @@ export class ChatwootHistoryService {
         },
       });
 
-      return this.getJob(instance, job.id);
+      return this.getJob(scopedInstance, job.id);
     } catch (error) {
       await this.prismaRepository.chatwootHistoryJob.update({
         where: { id: job.id },
@@ -246,9 +248,10 @@ export class ChatwootHistoryService {
   }
 
   public async execute(instance: InstanceDto, data: ChatwootHistoryExecuteDto) {
-    const sourceJob = await this.requireJob(instance, data.jobId);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const sourceJob = await this.requireJob(scopedInstance, data.jobId);
     const sourceContacts = await this.prismaRepository.chatwootHistoryJobContact.findMany({
-      where: { instanceId: instance.instanceId, jobId: sourceJob.id },
+      where: { instanceId: scopedInstance.instanceId, jobId: sourceJob.id },
       orderBy: { createdAt: 'asc' },
     });
 
@@ -261,11 +264,11 @@ export class ChatwootHistoryService {
       throw new BadRequestException('No contacts matched the execution criteria');
     }
 
-    const context = await this.requireAnalysisContext(instance);
+    const context = await this.requireAnalysisContext(scopedInstance);
     const startedAt = new Date();
     const executionJob = await this.prismaRepository.chatwootHistoryJob.create({
       data: {
-        instanceId: instance.instanceId,
+        instanceId: scopedInstance.instanceId,
         scopeType: sourceJob.scopeType,
         mode: data.mode,
         jobStatus: 'running',
@@ -296,19 +299,19 @@ export class ChatwootHistoryService {
 
     await this.prismaRepository.chatwootHistoryJobContact.createMany({
       data: selectedContacts.map((contact) =>
-        this.cloneContactForExecution(contact, executionJob.id, instance.instanceId, data.mode),
+        this.cloneContactForExecution(contact, executionJob.id, scopedInstance.instanceId, data.mode),
       ),
     });
 
     try {
       const executionContacts = await this.prismaRepository.chatwootHistoryJobContact.findMany({
-        where: { instanceId: instance.instanceId, jobId: executionJob.id },
+        where: { instanceId: scopedInstance.instanceId, jobId: executionJob.id },
         orderBy: { createdAt: 'asc' },
       });
 
       const results: PersistedContactRow[] = [];
       for (const contact of executionContacts) {
-        const updated = await this.executeContact(instance, context, data.mode, contact);
+        const updated = await this.executeContact(scopedInstance, context, data.mode, contact);
         results.push(this.mapExecutionContact(updated));
       }
 
@@ -337,7 +340,7 @@ export class ChatwootHistoryService {
         },
       });
 
-      return this.getJob(instance, executionJob.id);
+      return this.getJob(scopedInstance, executionJob.id);
     } catch (error) {
       await this.prismaRepository.chatwootHistoryJob.update({
         where: { id: executionJob.id },
@@ -353,15 +356,17 @@ export class ChatwootHistoryService {
   }
 
   public async listJobs(instance: InstanceDto) {
+    const scopedInstance = await this.resolveInstanceScope(instance);
     return this.prismaRepository.chatwootHistoryJob.findMany({
-      where: { instanceId: instance.instanceId },
+      where: { instanceId: scopedInstance.instanceId },
       orderBy: { createdAt: 'desc' },
     });
   }
 
   public async getJob(instance: InstanceDto, jobId: string) {
+    const scopedInstance = await this.resolveInstanceScope(instance);
     const job = await this.prismaRepository.chatwootHistoryJob.findFirst({
-      where: { id: jobId, instanceId: instance.instanceId },
+      where: { id: jobId, instanceId: scopedInstance.instanceId },
       include: {
         Contacts: {
           orderBy: { createdAt: 'asc' },
@@ -377,9 +382,10 @@ export class ChatwootHistoryService {
   }
 
   public async listConflicts(instance: InstanceDto) {
+    const scopedInstance = await this.resolveInstanceScope(instance);
     const contacts = await this.prismaRepository.chatwootHistoryJobContact.findMany({
       where: {
-        instanceId: instance.instanceId,
+        instanceId: scopedInstance.instanceId,
         classification: {
           in: ['needs_review', 'lid_alias', 'requires_rebuild'],
         },
@@ -401,17 +407,18 @@ export class ChatwootHistoryService {
   }
 
   public async reprocess(instance: InstanceDto, data: ChatwootHistoryReprocessDto) {
-    const job = await this.requireJob(instance, data.jobId);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const job = await this.requireJob(scopedInstance, data.jobId);
 
     if (job.mode === 'dryRun') {
       const filters = this.asObject(job.filters);
-      return this.analyze(instance, {
+      return this.analyze(scopedInstance, {
         scopeType: job.scopeType,
         remoteJids: data.remoteJid ? [data.remoteJid] : filters.remoteJids,
       });
     }
 
-    return this.execute(instance, {
+    return this.execute(scopedInstance, {
       jobId: data.jobId,
       mode: job.mode,
       selectionMode: 'selected',
@@ -419,7 +426,7 @@ export class ChatwootHistoryService {
         ? [data.remoteJid]
         : (
             await this.prismaRepository.chatwootHistoryJobContact.findMany({
-              where: { instanceId: instance.instanceId, jobId: job.id },
+              where: { instanceId: scopedInstance.instanceId, jobId: job.id },
               select: { remoteJid: true },
             })
           ).map((contact) => contact.remoteJid),
@@ -427,10 +434,11 @@ export class ChatwootHistoryService {
   }
 
   public async contactAction(instance: InstanceDto, data: ChatwootHistoryContactActionDto) {
-    const job = await this.requireJob(instance, data.jobId);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const job = await this.requireJob(scopedInstance, data.jobId);
     const contact = await this.prismaRepository.chatwootHistoryJobContact.findFirst({
       where: {
-        instanceId: instance.instanceId,
+        instanceId: scopedInstance.instanceId,
         jobId: job.id,
         remoteJid: data.remoteJid,
       },
@@ -469,10 +477,10 @@ export class ChatwootHistoryService {
         },
       });
 
-      return this.getJob(instance, job.id);
+      return this.getJob(scopedInstance, job.id);
     }
 
-    return this.execute(instance, {
+    return this.execute(scopedInstance, {
       jobId: job.id,
       mode: data.action === 'createRebuild' ? 'rebuild' : 'importDirect',
       selectionMode: 'selected',
@@ -481,7 +489,8 @@ export class ChatwootHistoryService {
   }
 
   public async exportCsv(instance: InstanceDto, jobId: string) {
-    const job = await this.getJob(instance, jobId);
+    const scopedInstance = await this.resolveInstanceScope(instance);
+    const job = await this.getJob(scopedInstance, jobId);
     const rows = job.Contacts || [];
     const header = [
       'remoteJid',
@@ -560,8 +569,9 @@ export class ChatwootHistoryService {
   }
 
   private async requireJob(instance: InstanceDto, jobId: string) {
+    const scopedInstance = await this.resolveInstanceScope(instance);
     const job = await this.prismaRepository.chatwootHistoryJob.findFirst({
-      where: { id: jobId, instanceId: instance.instanceId },
+      where: { id: jobId, instanceId: scopedInstance.instanceId },
     });
 
     if (!job) {
@@ -569,6 +579,26 @@ export class ChatwootHistoryService {
     }
 
     return job;
+  }
+
+  private async resolveInstanceScope(instance: InstanceDto): Promise<InstanceDto & { instanceId: string }> {
+    if (instance.instanceId) {
+      return instance as InstanceDto & { instanceId: string };
+    }
+
+    const persistedInstance = await this.prismaRepository.instance.findFirst({
+      where: { name: instance.instanceName },
+      select: { id: true },
+    });
+
+    if (!persistedInstance?.id) {
+      throw new NotFoundException(`Instance "${instance.instanceName}" not found`);
+    }
+
+    return {
+      ...instance,
+      instanceId: persistedInstance.id,
+    };
   }
 
   private async loadInboxContext(instance: InstanceDto) {
