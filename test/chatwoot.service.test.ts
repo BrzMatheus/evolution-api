@@ -27,4 +27,10 @@ export async function runChatwootServiceTests() {
 
   assert.equal(contactPayload.key, undefined);
   assert.equal(contactPayload.remoteJid, '5511999999999@s.whatsapp.net');
+
+  const brazilianCanonicalNumbers = (service as any).getNumbers('+5521988874200');
+  assert.deepEqual(brazilianCanonicalNumbers, ['+5521988874200']);
+
+  const brazilianLegacyNumbers = (service as any).getNumbers('+552188874200');
+  assert.deepEqual(brazilianLegacyNumbers, ['+552188874200', '+5521988874200']);
 }

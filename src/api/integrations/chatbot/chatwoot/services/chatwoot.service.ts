@@ -389,6 +389,22 @@ export class ChatwootService {
     }
   }
 
+  private getResponsePayload<T = any>(response: any): T[] {
+    if (Array.isArray(response?.payload)) {
+      return response.payload;
+    }
+
+    if (Array.isArray(response?.data?.payload)) {
+      return response.data.payload;
+    }
+
+    return [];
+  }
+
+  private selectExactIdentifierContact(contacts: any[], identifier: string) {
+    return contacts.find((contact) => contact?.identifier === identifier) || contacts[0] || null;
+  }
+
   public async addLabelToContact(nameInbox: string, contactId: number) {
     try {
       const uri = this.configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI;
@@ -434,42 +450,33 @@ export class ChatwootService {
       return null;
     }
 
-    // Direct search by query (q) - most common way to search by identifier/email/phone
-    const contact = (await (client as any).get('contacts/search', {
-      params: {
-        q: identifier,
-        sort: 'name',
+    const filteredContacts = await chatwootRequest(this.getClientCwConfig(), {
+      method: 'POST',
+      url: `/api/v1/accounts/${this.provider.accountId}/contacts/filter`,
+      body: {
+        payload: [
+          {
+            attribute_key: 'identifier',
+            filter_operator: 'equal_to',
+            values: [identifier],
+            query_operator: null,
+          },
+        ],
       },
-    })) as any;
+    });
 
-    if (contact && contact.data && contact.data.payload && contact.data.payload.length > 0) {
-      return contact.data.payload[0];
+    const filteredPayload = this.getResponsePayload(filteredContacts);
+    if (filteredPayload.length > 0) {
+      return this.selectExactIdentifierContact(filteredPayload, identifier);
     }
 
-    // Fallback for older API versions or different response structures
-    if (contact && contact.payload && contact.payload.length > 0) {
-      return contact.payload[0];
-    }
-
-    // Try search by attribute
-    const contactByAttr = (await (client as any).post('contacts/filter', {
-      payload: [
-        {
-          attribute_key: 'identifier',
-          filter_operator: 'equal_to',
-          values: [identifier],
-          query_operator: null,
-        },
-      ],
-    })) as any;
-
-    if (contactByAttr && contactByAttr.payload && contactByAttr.payload.length > 0) {
-      return contactByAttr.payload[0];
-    }
-
-    // Check inside data property if using axios interceptors wrapper
-    if (contactByAttr && contactByAttr.data && contactByAttr.data.payload && contactByAttr.data.payload.length > 0) {
-      return contactByAttr.data.payload[0];
+    const searchedContacts = await client.contacts.search({
+      accountId: this.provider.accountId,
+      q: identifier,
+    });
+    const searchedPayload = this.getResponsePayload(searchedContacts);
+    if (searchedPayload.length > 0) {
+      return this.selectExactIdentifierContact(searchedPayload, identifier);
     }
 
     return null;
@@ -596,12 +603,10 @@ export class ChatwootService {
   }
 
   private getNumbers(query: string) {
-    const numbers = [];
-    numbers.push(query);
+    const numbers = [query];
 
     if (query.startsWith('+55') && query.length === 14) {
-      const withoutNine = query.slice(0, 5) + query.slice(6);
-      numbers.push(withoutNine);
+      return numbers;
     } else if (query.startsWith('+55') && query.length === 13) {
       const withNine = query.slice(0, 5) + '9' + query.slice(5);
       numbers.push(withNine);
