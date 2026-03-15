@@ -608,7 +608,8 @@ export class ChatwootHistoryService {
     const validations: InboxValidation[] = [];
 
     const enabled = !!provider?.enabled;
-    const importExecutorAvailable = this.chatwootService.isImportHistoryAvailable();
+    const importHistoryAvailability = this.chatwootService.getImportHistoryAvailability();
+    const importExecutorAvailable = importHistoryAvailability.available;
     const hasAccountId = !!provider?.accountId;
     const hasNameInbox = !!provider?.nameInbox;
     const hasBaseUrl = !!provider?.url;
@@ -637,9 +638,7 @@ export class ChatwootHistoryService {
       code: 'chatwoot_import_executor_available',
       label: 'Executor manual-first disponivel',
       ok: importExecutorAvailable,
-      details: importExecutorAvailable
-        ? undefined
-        : 'Configure CHATWOOT.IMPORT.DATABASE.CONNECTION.URI para habilitar o importador.',
+      details: importExecutorAvailable ? undefined : importHistoryAvailability.reason,
     });
     validations.push({
       code: 'chatwoot_account_id_present',

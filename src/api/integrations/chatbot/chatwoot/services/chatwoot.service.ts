@@ -2750,9 +2750,48 @@ export class ChatwootService {
   }
 
   public isImportHistoryAvailable() {
-    const uri = this.configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI;
+    return this.getImportHistoryAvailability().available;
+  }
 
-    return uri && uri !== 'postgres://user:password@hostname:port/dbname';
+  public getImportHistoryAvailability() {
+    const uri = this.configService.get<Chatwoot>('CHATWOOT').IMPORT.DATABASE.CONNECTION.URI?.trim();
+
+    if (!uri) {
+      return {
+        available: false,
+        reason: 'Configure CHATWOOT_IMPORT_DATABASE_CONNECTION_URI com a URI do PostgreSQL do Chatwoot.',
+      };
+    }
+
+    if (uri === 'postgres://user:password@hostname:port/dbname') {
+      return {
+        available: false,
+        reason: 'Substitua a URI placeholder do importador por uma conexao real do PostgreSQL do Chatwoot.',
+      };
+    }
+
+    try {
+      const parsedUri = new URL(uri);
+      const hostname = parsedUri.hostname?.trim().toLowerCase();
+
+      if (!hostname || hostname === 'host' || hostname === 'hostname') {
+        return {
+          available: false,
+          reason:
+            'CHATWOOT_IMPORT_DATABASE_CONNECTION_URI ainda usa host placeholder. Informe o hostname real do PostgreSQL do Chatwoot.',
+        };
+      }
+    } catch {
+      return {
+        available: false,
+        reason: 'CHATWOOT_IMPORT_DATABASE_CONNECTION_URI esta invalida.',
+      };
+    }
+
+    return {
+      available: true,
+      reason: null,
+    };
   }
 
   public addHistoryMessages(instance: InstanceDto, messagesRaw: MessageModel[]) {

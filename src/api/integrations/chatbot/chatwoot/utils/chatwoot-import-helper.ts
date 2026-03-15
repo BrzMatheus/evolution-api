@@ -284,11 +284,18 @@ class ChatwootImport {
         });
       });
 
-      const existingSourceIds = await this.getExistingSourceIds(messagesOrdered.map((message: any) => message.key.id));
-      messagesOrdered = messagesOrdered.filter((message: any) => {
-        const sourceId = this.normalizeSourceId(message?.key?.id);
-        return !sourceId || !existingSourceIds.has(sourceId);
-      });
+      // When a history job already resolved the target conversation, dedupe must happen against that
+      // conversation only. A global source_id prefilter can hide messages that are still missing from
+      // the canonical timeline because the same WAID exists elsewhere in Chatwoot.
+      if (!options?.forceFksByPhoneNumber?.size) {
+        const existingSourceIds = await this.getExistingSourceIds(
+          messagesOrdered.map((message: any) => message.key.id),
+        );
+        messagesOrdered = messagesOrdered.filter((message: any) => {
+          const sourceId = this.normalizeSourceId(message?.key?.id);
+          return !sourceId || !existingSourceIds.has(sourceId);
+        });
+      }
       // processing messages in batch
       const batchSize = 4000;
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
