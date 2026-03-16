@@ -83,6 +83,7 @@ type ChatwootReviewPayload = {
 type ConversationMetrics = {
   candidateConversationIds: number[];
   candidateConversationDisplayIds: number[];
+  relatedInboxIds: number[];
   selectedConversationId: number | null;
   selectedConversationDisplayId: number | null;
   candidateConversations: CandidateConversationMetrics[];
@@ -98,6 +99,7 @@ type ConversationMetrics = {
 type CandidateConversationMetrics = {
   internalId: number;
   displayId: number;
+  inboxId: number;
   status: ChatwootConversationCandidate['status'];
   messageCount: number;
   attachmentMessageCount: number;
@@ -898,6 +900,7 @@ export class ChatwootHistoryService {
         overlapCount: conversationMetrics.overlapCount,
         candidateConversationIds: conversationMetrics.candidateConversationIds,
         candidateConversationDisplayIds: conversationMetrics.candidateConversationDisplayIds,
+        relatedInboxIds: conversationMetrics.relatedInboxIds,
         candidateConversations: conversationMetrics.candidateConversations,
         selectedConversationId: conversationMetrics.selectedConversationId,
         selectedConversationDisplayId: conversationMetrics.selectedConversationDisplayId,
@@ -1037,6 +1040,7 @@ export class ChatwootHistoryService {
       return {
         candidateConversationIds: [],
         candidateConversationDisplayIds: [],
+        relatedInboxIds: [],
         selectedConversationId: null,
         selectedConversationDisplayId: null,
         candidateConversations: [],
@@ -1055,6 +1059,17 @@ export class ChatwootHistoryService {
       chatwootContactId,
       context.inboxId,
     );
+    const relatedConversationCandidates = await this.chatwootService.listContactConversationCandidates(
+      instance,
+      chatwootContactId,
+    );
+    const relatedInboxIds = Array.from(
+      new Set(
+        relatedConversationCandidates
+          .map((conversation) => Number(conversation.inboxId))
+          .filter((inboxId) => Number.isFinite(inboxId) && inboxId > 0),
+      ),
+    ).sort((left, right) => left - right);
 
     const candidateConversationIds = candidateConversations.map((conversation) => conversation.internalId);
     const candidateConversationDisplayIds = candidateConversations.map((conversation) => conversation.displayId);
@@ -1063,6 +1078,7 @@ export class ChatwootHistoryService {
       return {
         candidateConversationIds: [],
         candidateConversationDisplayIds: [],
+        relatedInboxIds,
         selectedConversationId: null,
         selectedConversationDisplayId: null,
         candidateConversations: [],
@@ -1116,6 +1132,7 @@ export class ChatwootHistoryService {
       candidateConversationMetrics.push({
         internalId: candidateConversation.internalId,
         displayId: candidateConversation.displayId,
+        inboxId: candidateConversation.inboxId,
         status: candidateConversation.status,
         messageCount: candidateConversation.messageCount,
         attachmentMessageCount: candidateConversation.attachmentMessageCount,
@@ -1137,6 +1154,7 @@ export class ChatwootHistoryService {
     return {
       candidateConversationIds,
       candidateConversationDisplayIds,
+      relatedInboxIds,
       selectedConversationId,
       selectedConversationDisplayId,
       candidateConversations: candidateConversationMetrics,
@@ -1794,6 +1812,7 @@ export class ChatwootHistoryService {
     overlapCount: number;
     candidateConversationIds: number[];
     candidateConversationDisplayIds: number[];
+    relatedInboxIds: number[];
     candidateConversations: CandidateConversationMetrics[];
     selectedConversationId: number | null;
     selectedConversationDisplayId: number | null;
@@ -1831,6 +1850,7 @@ export class ChatwootHistoryService {
         hasLidAlias: args.hasLidAlias,
         candidateConversationIds: args.candidateConversationIds,
         candidateConversationDisplayIds: args.candidateConversationDisplayIds,
+        relatedInboxIds: args.relatedInboxIds,
         matchedCanonicalSourceIds: args.matchedCanonicalSourceIds,
         matchedFallbackSignatures: args.matchedFallbackSignatures,
         sourceIdCollisionRisk: args.sourceIdCollisionRisk,
@@ -1838,6 +1858,7 @@ export class ChatwootHistoryService {
       conversationSelection: {
         selectedConversationInternalId: args.selectedConversationId,
         selectedConversationDisplayId: args.selectedConversationDisplayId,
+        relatedInboxIds: args.relatedInboxIds,
         candidateConversations: args.candidateConversations,
       },
       overlapMetrics: {
