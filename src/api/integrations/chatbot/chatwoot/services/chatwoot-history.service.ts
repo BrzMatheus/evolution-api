@@ -5,7 +5,10 @@ import {
   ChatwootHistoryExecuteDto,
   ChatwootHistoryReprocessDto,
 } from '@api/integrations/chatbot/chatwoot/dto/chatwoot-history.dto';
-import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
+import {
+  ChatwootConversationCandidate,
+  ChatwootService,
+} from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
 import {
   CanonicalIdentityType,
   classifyChatwootHistoryContact,
@@ -79,7 +82,10 @@ type ChatwootReviewPayload = {
 
 type ConversationMetrics = {
   candidateConversationIds: number[];
+  candidateConversationDisplayIds: number[];
   selectedConversationId: number | null;
+  selectedConversationDisplayId: number | null;
+  candidateConversations: CandidateConversationMetrics[];
   chatwootMessageCount: number;
   overlapCount: number;
   sourceIdCollisionRisk: boolean;
@@ -87,6 +93,22 @@ type ConversationMetrics = {
   lastMessageAt: string | null;
   matchedCanonicalSourceIds: string[];
   matchedFallbackSignatures: string[];
+};
+
+type CandidateConversationMetrics = {
+  internalId: number;
+  displayId: number;
+  status: ChatwootConversationCandidate['status'];
+  messageCount: number;
+  attachmentMessageCount: number;
+  overlapCount: number;
+  sourceIdCollisionRisk: boolean;
+  firstMessageAt: string | null;
+  lastMessageAt: string | null;
+  lastActivityAt: string | null;
+  matchedCanonicalSourceIds: string[];
+  matchedFallbackSignatures: string[];
+  reviewUrl: string | null;
 };
 
 type PersistedContactRow = {
@@ -268,6 +290,7 @@ export class ChatwootHistoryService {
     }
 
     const selectedContacts = this.selectContactsForExecution(sourceContacts, data);
+    const conversationSelections = this.buildConversationSelectionMap(data.conversationSelections);
     if (selectedContacts.length === 0) {
       throw new BadRequestException('No contacts matched the execution criteria');
     }
@@ -307,7 +330,13 @@ export class ChatwootHistoryService {
 
     await this.prismaRepository.chatwootHistoryJobContact.createMany({
       data: selectedContacts.map((contact) =>
-        this.cloneContactForExecution(contact, executionJob.id, scopedInstance.instanceId, data.mode),
+        this.cloneContactForExecution(
+          contact,
+          executionJob.id,
+          scopedInstance.instanceId,
+          data.mode,
+          conversationSelections.get(contact.remoteJid) || null,
+        ),
       ),
     });
 
@@ -497,6 +526,15 @@ export class ChatwootHistoryService {
         mode: data.action === 'createRebuild' ? 'rebuild' : 'importDirect',
         selectionMode: 'selected',
         remoteJids: [contact.remoteJid],
+        conversationSelections:
+          data.canonicalConversationId && Number.isFinite(Number(data.canonicalConversationId))
+            ? [
+                {
+                  remoteJid: contact.remoteJid,
+                  canonicalConversationId: Number(data.canonicalConversationId),
+                },
+              ]
+            : undefined,
       },
       data.action === 'importDirect'
         ? {
@@ -815,7 +853,7 @@ export class ChatwootHistoryService {
       context.provider,
       context.inboxId,
       chatwootContact?.id ? Number(chatwootContact.id) : null,
-      conversationMetrics.selectedConversationId,
+      conversationMetrics.selectedConversationDisplayId,
     );
     const firstMessageTimestamp = evolutionMessages[0]?.messageTimestamp || null;
     const lastMessageTimestamp = evolutionMessages[evolutionMessages.length - 1]?.messageTimestamp || null;
@@ -859,6 +897,10 @@ export class ChatwootHistoryService {
         chatwootMessageCount: conversationMetrics.chatwootMessageCount,
         overlapCount: conversationMetrics.overlapCount,
         candidateConversationIds: conversationMetrics.candidateConversationIds,
+        candidateConversationDisplayIds: conversationMetrics.candidateConversationDisplayIds,
+        candidateConversations: conversationMetrics.candidateConversations,
+        selectedConversationId: conversationMetrics.selectedConversationId,
+        selectedConversationDisplayId: conversationMetrics.selectedConversationDisplayId,
         matchedCanonicalSourceIds: conversationMetrics.matchedCanonicalSourceIds,
         matchedFallbackSignatures: conversationMetrics.matchedFallbackSignatures,
         sourceIdCollisionRisk: conversationMetrics.sourceIdCollisionRisk,
@@ -994,7 +1036,10 @@ export class ChatwootHistoryService {
     if (!chatwootContactId) {
       return {
         candidateConversationIds: [],
+        candidateConversationDisplayIds: [],
         selectedConversationId: null,
+        selectedConversationDisplayId: null,
+        candidateConversations: [],
         chatwootMessageCount: 0,
         overlapCount: 0,
         sourceIdCollisionRisk: false,
@@ -1005,15 +1050,22 @@ export class ChatwootHistoryService {
       };
     }
 
-    const candidateConversationIds = (await this.chatwootService.listContactConversations(instance, chatwootContactId))
-      .filter((conversation) => Number(conversation?.inbox_id) === context.inboxId)
-      .map((conversation) => Number(conversation.id))
-      .sort((left, right) => right - left);
+    const candidateConversations = await this.chatwootService.listInboxConversationCandidates(
+      instance,
+      chatwootContactId,
+      context.inboxId,
+    );
+
+    const candidateConversationIds = candidateConversations.map((conversation) => conversation.internalId);
+    const candidateConversationDisplayIds = candidateConversations.map((conversation) => conversation.displayId);
 
     if (candidateConversationIds.length === 0) {
       return {
         candidateConversationIds: [],
+        candidateConversationDisplayIds: [],
         selectedConversationId: null,
+        selectedConversationDisplayId: null,
+        candidateConversations: [],
         chatwootMessageCount: 0,
         overlapCount: 0,
         sourceIdCollisionRisk: false,
@@ -1031,37 +1083,63 @@ export class ChatwootHistoryService {
     let sourceIdCollisionRisk = false;
     let firstMessageAt: string | null = null;
     let lastMessageAt: string | null = null;
+    const candidateConversationMetrics: CandidateConversationMetrics[] = [];
 
-    for (const conversationId of candidateConversationIds) {
-      const [messageCount, inspection, window] = await Promise.all([
-        this.chatwootService.countConversationMessages(instance, conversationId),
-        chatwootImport.inspectConversationMessages(
-          instance,
-          this.chatwootService,
-          context.provider,
-          conversationId,
-          evolutionMessages,
-        ),
-        this.chatwootService.getConversationMessageWindow(instance, conversationId),
-      ]);
+    for (const candidateConversation of candidateConversations) {
+      const inspection = await chatwootImport.inspectConversationMessages(
+        instance,
+        this.chatwootService,
+        context.provider,
+        candidateConversation.internalId,
+        evolutionMessages,
+      );
 
-      chatwootMessageCount += messageCount;
+      chatwootMessageCount += candidateConversation.messageCount;
       sourceIdCollisionRisk = sourceIdCollisionRisk || inspection.sourceIdCollisionRisk;
       inspection.matchedTokens.forEach((value) => matchedTokens.add(value));
       inspection.matchedCanonicalSourceIds.forEach((value) => matchedCanonicalSourceIds.add(value));
       inspection.matchedFallbackSignatures.forEach((value) => matchedFallbackSignatures.add(value));
 
-      if (window.firstMessageAt && (!firstMessageAt || new Date(window.firstMessageAt) < new Date(firstMessageAt))) {
-        firstMessageAt = window.firstMessageAt;
+      if (
+        candidateConversation.firstMessageAt &&
+        (!firstMessageAt || new Date(candidateConversation.firstMessageAt) < new Date(firstMessageAt))
+      ) {
+        firstMessageAt = candidateConversation.firstMessageAt;
       }
-      if (window.lastMessageAt && (!lastMessageAt || new Date(window.lastMessageAt) > new Date(lastMessageAt))) {
-        lastMessageAt = window.lastMessageAt;
+      if (
+        candidateConversation.lastMessageAt &&
+        (!lastMessageAt || new Date(candidateConversation.lastMessageAt) > new Date(lastMessageAt))
+      ) {
+        lastMessageAt = candidateConversation.lastMessageAt;
       }
+
+      candidateConversationMetrics.push({
+        internalId: candidateConversation.internalId,
+        displayId: candidateConversation.displayId,
+        status: candidateConversation.status,
+        messageCount: candidateConversation.messageCount,
+        attachmentMessageCount: candidateConversation.attachmentMessageCount,
+        overlapCount: inspection.overlapCount,
+        sourceIdCollisionRisk: inspection.sourceIdCollisionRisk,
+        firstMessageAt: candidateConversation.firstMessageAt,
+        lastMessageAt: candidateConversation.lastMessageAt,
+        lastActivityAt: candidateConversation.lastActivityAt,
+        matchedCanonicalSourceIds: Array.from(inspection.matchedCanonicalSourceIds),
+        matchedFallbackSignatures: Array.from(inspection.matchedFallbackSignatures),
+        reviewUrl: this.buildConversationUrl(context.provider, candidateConversation.displayId),
+      });
     }
+
+    const selectedConversationId = candidateConversations.length === 1 ? candidateConversations[0].internalId : null;
+    const selectedConversationDisplayId =
+      candidateConversations.length === 1 ? candidateConversations[0].displayId : null;
 
     return {
       candidateConversationIds,
-      selectedConversationId: candidateConversationIds.length === 1 ? candidateConversationIds[0] : null,
+      candidateConversationDisplayIds,
+      selectedConversationId,
+      selectedConversationDisplayId,
+      candidateConversations: candidateConversationMetrics,
       chatwootMessageCount,
       overlapCount: matchedTokens.size,
       sourceIdCollisionRisk,
@@ -1165,7 +1243,47 @@ export class ChatwootHistoryService {
       chatwootImport.clearAll(instance);
       chatwootImport.addHistoryMessages(instance, messages as any);
 
-      let targetConversationId = contact.selectedConversationId ? Number(contact.selectedConversationId) : null;
+      const report = this.asObject(contact.report);
+      const conversationSelection = this.asObject(report.conversationSelection);
+      const candidateConversationDetails = Array.isArray(conversationSelection.candidateConversations)
+        ? conversationSelection.candidateConversations
+            .map((candidate) => this.asObject(candidate))
+            .filter((candidate) => Number.isFinite(Number(candidate.internalId)))
+            .map((candidate) => ({
+              internalId: Number(candidate.internalId),
+              displayId: Number(candidate.displayId || 0),
+            }))
+        : [];
+      const candidateConversationIds =
+        candidateConversationDetails.length > 0
+          ? candidateConversationDetails.map((candidate) => candidate.internalId)
+          : Array.isArray(contact.candidateConversationIds)
+            ? contact.candidateConversationIds.map(Number).filter((conversationId) => Number.isFinite(conversationId))
+            : [];
+      let preferredCanonicalConversationId = contact.selectedConversationId
+        ? Number(contact.selectedConversationId)
+        : null;
+      if (
+        preferredCanonicalConversationId &&
+        candidateConversationDetails.length > 0 &&
+        !candidateConversationIds.includes(preferredCanonicalConversationId)
+      ) {
+        const matchedDisplayCandidate = candidateConversationDetails.find(
+          (candidate) => candidate.displayId === preferredCanonicalConversationId,
+        );
+        if (matchedDisplayCandidate) {
+          preferredCanonicalConversationId = matchedDisplayCandidate.internalId;
+        }
+      }
+      if (
+        preferredCanonicalConversationId &&
+        candidateConversationIds.length > 0 &&
+        !candidateConversationIds.includes(preferredCanonicalConversationId)
+      ) {
+        throw new Error('Selected canonical conversation is not part of the available Chatwoot candidates');
+      }
+
+      let targetConversationId = preferredCanonicalConversationId;
       let rebuiltConversationId = contact.rebuiltConversationId ? Number(contact.rebuiltConversationId) : null;
       const forceFksByPhoneNumber = new Map<string, FksChatwoot>();
       const aliases = getJidAliases({
@@ -1182,26 +1300,27 @@ export class ChatwootHistoryService {
       };
 
       if (mode === 'rebuild') {
-        rebuiltConversationId = await this.createRebuildConversation(
-          instance,
-          context.inboxId,
-          contact.remoteJid,
-          contact.pushName,
-          contact.selectedConversationId
-            ? Number(contact.selectedConversationId)
-            : Array.isArray(contact.candidateConversationIds) && contact.candidateConversationIds.length > 0
-              ? Number(contact.candidateConversationIds[0])
-              : null,
-        );
-        if (!rebuiltConversationId) {
-          throw new Error('Unable to create rebuilt conversation');
+        if (preferredCanonicalConversationId) {
+          targetConversationId = preferredCanonicalConversationId;
+          rebuiltConversationId = null;
+        } else {
+          rebuiltConversationId = await this.createRebuildConversation(
+            instance,
+            context.inboxId,
+            contact.remoteJid,
+            contact.pushName,
+            candidateConversationIds.length > 0 ? Number(candidateConversationIds[0]) : null,
+          );
+          if (!rebuiltConversationId) {
+            throw new Error('Unable to create rebuilt conversation');
+          }
+          targetConversationId = rebuiltConversationId;
         }
-        targetConversationId = rebuiltConversationId;
 
         consolidationResult = await this.chatwootService.consolidateConversationHistory(
           instance,
-          rebuiltConversationId,
-          Array.isArray(contact.candidateConversationIds) ? contact.candidateConversationIds.map(Number) : [],
+          targetConversationId,
+          candidateConversationIds.filter((conversationId) => conversationId !== targetConversationId),
         );
       }
 
@@ -1229,21 +1348,29 @@ export class ChatwootHistoryService {
         });
       }
 
-      if (mode === 'rebuild' && consolidationResult.movedMessageCount + importedMessagesCount === 0) {
+      const finalTargetConversation =
+        targetConversationId && mode === 'rebuild'
+          ? await this.chatwootService.getConversationCandidateByInternalId(instance, targetConversationId)
+          : null;
+
+      if (mode === 'rebuild' && (!finalTargetConversation || finalTargetConversation.messageCount === 0)) {
         throw new Error('Rebuild created a canonical conversation but no messages were materialized into it');
       }
 
       const latestContact = await this.findChatwootContact(instance, contact.remoteJid, resolved);
       const latestConversation =
-        latestContact?.id && context.inboxId
-          ? await this.chatwootService.getLatestInboxConversation(instance, Number(latestContact.id), context.inboxId)
-          : null;
-      const latestConversationId =
-        mode === 'rebuild'
-          ? rebuiltConversationId
-          : targetConversationId || (latestConversation?.id ? Number(latestConversation.id) : null);
-      if (latestConversationId) {
-        await this.chatwootService.setConversationCacheForIdentifiers(instance, aliases, latestConversationId);
+        finalTargetConversation ||
+        (latestContact?.id && context.inboxId
+          ? await this.chatwootService.getLatestInboxConversationCandidate(
+              instance,
+              Number(latestContact.id),
+              context.inboxId,
+            )
+          : null);
+      const latestConversationId = latestConversation?.internalId || targetConversationId || null;
+      const latestConversationDisplayId = latestConversation?.displayId || null;
+      if (latestConversationDisplayId) {
+        await this.chatwootService.setConversationCacheForIdentifiers(instance, aliases, latestConversationDisplayId);
       }
       const latestChatwootCount = latestConversationId
         ? await this.chatwootService.countConversationMessages(instance, latestConversationId)
@@ -1252,7 +1379,7 @@ export class ChatwootHistoryService {
         context.provider,
         context.inboxId,
         latestContact?.id ? Number(latestContact.id) : contact.chatwootContactId || null,
-        latestConversationId,
+        latestConversationDisplayId,
       );
       const executionWarnings = [
         !isSafeForMode && allowUnsafeOverride
@@ -1273,7 +1400,7 @@ export class ChatwootHistoryService {
         executionStatus: 'completed',
         chatwootContactId: latestContact?.id ? Number(latestContact.id) : contact.chatwootContactId,
         existingConversationId: mode === 'importDirect' ? latestConversationId : contact.existingConversationId,
-        selectedConversationId: mode === 'importDirect' ? latestConversationId : contact.selectedConversationId,
+        selectedConversationId: latestConversationId,
         rebuiltConversationId,
         chatwootMessageCount: latestChatwootCount,
         report: this.toJsonInput(
@@ -1283,6 +1410,8 @@ export class ChatwootHistoryService {
             executionError: null,
             rebuiltConversationId,
             reviewPayload,
+            canonicalConversationInternalId: latestConversationId,
+            canonicalConversationDisplayId: latestConversationDisplayId,
             executionWarning: executionWarnings.length > 0 ? executionWarnings.join(' | ') : null,
             supersededConversationIds: consolidationResult.supersededConversationIds,
             movedChatwootMessageCount: consolidationResult.movedMessageCount,
@@ -1370,6 +1499,26 @@ export class ChatwootHistoryService {
       : sourceContacts.filter((contact) => this.isSafeForMode(contact, data.mode));
   }
 
+  private buildConversationSelectionMap(
+    selections?: {
+      remoteJid: string;
+      canonicalConversationId?: number;
+    }[],
+  ) {
+    const selectionMap = new Map<string, number>();
+
+    (selections || []).forEach((selection) => {
+      const canonicalConversationId = Number(selection?.canonicalConversationId);
+      if (!selection?.remoteJid || !Number.isFinite(canonicalConversationId) || canonicalConversationId <= 0) {
+        return;
+      }
+
+      selectionMap.set(selection.remoteJid, canonicalConversationId);
+    });
+
+    return selectionMap;
+  }
+
   private isSafeForMode(contact: any, mode: Exclude<JobMode, 'dryRun'>) {
     if (mode === 'importDirect') {
       return !!contact.isSafeDirectImport;
@@ -1378,7 +1527,24 @@ export class ChatwootHistoryService {
     return ['needs_review', 'requires_rebuild', 'lid_alias'].includes(contact.classification);
   }
 
-  private cloneContactForExecution(contact: any, jobId: string, instanceId: string, mode: Exclude<JobMode, 'dryRun'>) {
+  private cloneContactForExecution(
+    contact: any,
+    jobId: string,
+    instanceId: string,
+    mode: Exclude<JobMode, 'dryRun'>,
+    canonicalConversationId: number | null = null,
+  ) {
+    const report = this.asObject(contact.report);
+    const conversationSelection = this.asObject(report.conversationSelection);
+    const candidateConversations = Array.isArray(conversationSelection.candidateConversations)
+      ? conversationSelection.candidateConversations
+      : [];
+    const selectedCandidate = canonicalConversationId
+      ? candidateConversations.find(
+          (candidate) => Number(this.asObject(candidate).internalId) === Number(canonicalConversationId),
+        )
+      : null;
+
     return {
       jobId,
       instanceId,
@@ -1401,12 +1567,32 @@ export class ChatwootHistoryService {
       overlapCount: contact.overlapCount,
       chatwootContactId: contact.chatwootContactId,
       existingConversationId: contact.existingConversationId,
-      selectedConversationId: contact.selectedConversationId,
+      selectedConversationId: canonicalConversationId ?? contact.selectedConversationId,
       rebuiltConversationId: contact.rebuiltConversationId,
       candidateConversationIds: this.toJsonInput(
         Array.isArray(contact.candidateConversationIds) ? contact.candidateConversationIds : [],
       ),
-      report: this.toJsonInput(contact.report || {}),
+      report: this.toJsonInput(
+        canonicalConversationId
+          ? {
+              ...report,
+              conversationSelection: {
+                ...conversationSelection,
+                selectedConversationInternalId: canonicalConversationId,
+                selectedConversationDisplayId: selectedCandidate
+                  ? Number(this.asObject(selectedCandidate).displayId)
+                  : conversationSelection.selectedConversationDisplayId || null,
+              },
+              consolidation: {
+                ...this.asObject(report.consolidation),
+                canonicalConversationInternalId: canonicalConversationId,
+                canonicalConversationDisplayId: selectedCandidate
+                  ? Number(this.asObject(selectedCandidate).displayId)
+                  : this.asObject(report.consolidation).canonicalConversationDisplayId || null,
+              },
+            }
+          : report,
+      ),
     };
   }
 
@@ -1607,6 +1793,10 @@ export class ChatwootHistoryService {
     chatwootMessageCount: number;
     overlapCount: number;
     candidateConversationIds: number[];
+    candidateConversationDisplayIds: number[];
+    candidateConversations: CandidateConversationMetrics[];
+    selectedConversationId: number | null;
+    selectedConversationDisplayId: number | null;
     matchedCanonicalSourceIds: string[];
     matchedFallbackSignatures: string[];
     sourceIdCollisionRisk: boolean;
@@ -1640,9 +1830,15 @@ export class ChatwootHistoryService {
       evidence: {
         hasLidAlias: args.hasLidAlias,
         candidateConversationIds: args.candidateConversationIds,
+        candidateConversationDisplayIds: args.candidateConversationDisplayIds,
         matchedCanonicalSourceIds: args.matchedCanonicalSourceIds,
         matchedFallbackSignatures: args.matchedFallbackSignatures,
         sourceIdCollisionRisk: args.sourceIdCollisionRisk,
+      },
+      conversationSelection: {
+        selectedConversationInternalId: args.selectedConversationId,
+        selectedConversationDisplayId: args.selectedConversationDisplayId,
+        candidateConversations: args.candidateConversations,
       },
       overlapMetrics: {
         evolutionMessageCount: args.evolutionMessageCount,
@@ -1669,6 +1865,9 @@ export class ChatwootHistoryService {
       consolidation: {
         strategy: 'create_new_canonical_and_resolve_sources',
         candidateConversationIds: args.candidateConversationIds,
+        candidateConversationDisplayIds: args.candidateConversationDisplayIds,
+        canonicalConversationInternalId: args.selectedConversationId,
+        canonicalConversationDisplayId: args.selectedConversationDisplayId,
         supersededConversationIds: [],
         movedChatwootMessageCount: 0,
         resolvedSupersededConversationIds: [],
@@ -1691,6 +1890,8 @@ export class ChatwootHistoryService {
       executionError: string | null;
       rebuiltConversationId: number | null;
       reviewPayload: ChatwootReviewPayload;
+      canonicalConversationInternalId?: number | null;
+      canonicalConversationDisplayId?: number | null;
       executionWarning?: string | null;
       supersededConversationIds?: number[];
       movedChatwootMessageCount?: number;
@@ -1701,6 +1902,7 @@ export class ChatwootHistoryService {
     const existingDecision = this.asObject(report.decision);
     const execution = this.asObject(report.execution);
     const consolidation = this.asObject(report.consolidation);
+    const conversationSelection = this.asObject(report.conversationSelection);
 
     return {
       ...report,
@@ -1716,8 +1918,19 @@ export class ChatwootHistoryService {
         warning: args.executionWarning || execution.warning || null,
         finishedAt: new Date().toISOString(),
       },
+      conversationSelection: {
+        ...conversationSelection,
+        selectedConversationInternalId:
+          args.canonicalConversationInternalId ?? conversationSelection.selectedConversationInternalId ?? null,
+        selectedConversationDisplayId:
+          args.canonicalConversationDisplayId ?? conversationSelection.selectedConversationDisplayId ?? null,
+      },
       consolidation: {
         ...consolidation,
+        canonicalConversationInternalId:
+          args.canonicalConversationInternalId ?? consolidation.canonicalConversationInternalId ?? null,
+        canonicalConversationDisplayId:
+          args.canonicalConversationDisplayId ?? consolidation.canonicalConversationDisplayId ?? null,
         supersededConversationIds:
           args.supersededConversationIds ||
           (Array.isArray(consolidation.supersededConversationIds) ? consolidation.supersededConversationIds : []),
@@ -1735,9 +1948,10 @@ export class ChatwootHistoryService {
       },
       review: args.reviewPayload,
       chatwootConversationUrl: args.reviewPayload.chatwootConversationId ? args.reviewPayload.chatwootReviewUrl : null,
-      rebuiltConversationUrl: args.rebuiltConversationId
-        ? this.buildConversationUrlFromReview(args.reviewPayload, args.rebuiltConversationId)
-        : report.rebuiltConversationUrl || null,
+      rebuiltConversationUrl:
+        args.rebuiltConversationId && args.canonicalConversationDisplayId
+          ? this.buildConversationUrlFromReview(args.reviewPayload, args.canonicalConversationDisplayId)
+          : report.rebuiltConversationUrl || null,
     };
   }
 

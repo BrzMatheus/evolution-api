@@ -42,6 +42,18 @@ interface ChatwootMessage {
   isRead?: boolean;
 }
 
+export interface ChatwootConversationCandidate {
+  internalId: number;
+  displayId: number;
+  inboxId: number;
+  status: 'open' | 'resolved' | 'pending' | 'snoozed' | 'unknown';
+  messageCount: number;
+  attachmentMessageCount: number;
+  firstMessageAt: string | null;
+  lastMessageAt: string | null;
+  lastActivityAt: string | null;
+}
+
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
   private readonly CHATWOOT_STATUS_OPEN = 0;
@@ -669,6 +681,21 @@ export class ChatwootService {
     return [...conversations].sort((left, right) => (right?.id || 0) - (left?.id || 0));
   }
 
+  private normalizeConversationStatus(status: number | string | null | undefined) {
+    switch (Number(status)) {
+      case 0:
+        return 'open';
+      case 1:
+        return 'resolved';
+      case 2:
+        return 'pending';
+      case 3:
+        return 'snoozed';
+      default:
+        return 'unknown';
+    }
+  }
+
   private pickPreferredInboxConversation(
     conversations: conversation[],
     inboxId: number,
@@ -1140,6 +1167,137 @@ export class ChatwootService {
   ): Promise<conversation | null> {
     const conversations = await this.listContactConversations(instance, contactId);
     return this.pickPreferredInboxConversation(conversations, inboxId);
+  }
+
+  public async listInboxConversationCandidates(
+    instance: InstanceDto,
+    contactId: number,
+    inboxId: number,
+  ): Promise<ChatwootConversationCandidate[]> {
+    const provider = await this.getProvider(instance);
+    if (!provider || !contactId || !inboxId) {
+      return [];
+    }
+
+    const result = (await this.pgClient.query(
+      `SELECT conversations.id AS internal_id,
+              conversations.display_id,
+              conversations.inbox_id,
+              conversations.status,
+              conversations.last_activity_at,
+              COUNT(messages.id)::INTEGER AS message_count,
+              COUNT(messages.id) FILTER (
+                WHERE COALESCE(messages.content_type, 0) <> 0
+              )::INTEGER AS attachment_message_count,
+              MIN(messages.created_at) AS first_message_at,
+              MAX(messages.created_at) AS last_message_at
+         FROM conversations
+         LEFT JOIN messages
+           ON messages.account_id = conversations.account_id
+          AND messages.conversation_id = conversations.id
+        WHERE conversations.account_id = $1
+          AND conversations.contact_id = $2
+          AND conversations.inbox_id = $3
+        GROUP BY conversations.id, conversations.display_id, conversations.inbox_id, conversations.status, conversations.last_activity_at
+        ORDER BY COALESCE(conversations.last_activity_at, MAX(messages.created_at), MIN(messages.created_at)) DESC NULLS LAST,
+                 conversations.id DESC`,
+      [provider.accountId, contactId, inboxId],
+    )) as {
+      rows: {
+        internal_id: number;
+        display_id: number;
+        inbox_id: number;
+        status: number;
+        last_activity_at: Date | null;
+        message_count: number;
+        attachment_message_count: number;
+        first_message_at: Date | null;
+        last_message_at: Date | null;
+      }[];
+    };
+
+    return (result?.rows || []).map((row) => ({
+      internalId: Number(row.internal_id),
+      displayId: Number(row.display_id),
+      inboxId: Number(row.inbox_id),
+      status: this.normalizeConversationStatus(row.status),
+      messageCount: Number(row.message_count || 0),
+      attachmentMessageCount: Number(row.attachment_message_count || 0),
+      firstMessageAt: row.first_message_at ? new Date(row.first_message_at).toISOString() : null,
+      lastMessageAt: row.last_message_at ? new Date(row.last_message_at).toISOString() : null,
+      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).toISOString() : null,
+    }));
+  }
+
+  public async getLatestInboxConversationCandidate(
+    instance: InstanceDto,
+    contactId: number,
+    inboxId: number,
+  ): Promise<ChatwootConversationCandidate | null> {
+    const candidates = await this.listInboxConversationCandidates(instance, contactId, inboxId);
+    return candidates[0] || null;
+  }
+
+  public async getConversationCandidateByInternalId(
+    instance: InstanceDto,
+    conversationId: number,
+  ): Promise<ChatwootConversationCandidate | null> {
+    const provider = await this.getProvider(instance);
+    if (!provider || !conversationId) {
+      return null;
+    }
+
+    const result = (await this.pgClient.query(
+      `SELECT conversations.id AS internal_id,
+              conversations.display_id,
+              conversations.inbox_id,
+              conversations.status,
+              conversations.last_activity_at,
+              COUNT(messages.id)::INTEGER AS message_count,
+              COUNT(messages.id) FILTER (
+                WHERE COALESCE(messages.content_type, 0) <> 0
+              )::INTEGER AS attachment_message_count,
+              MIN(messages.created_at) AS first_message_at,
+              MAX(messages.created_at) AS last_message_at
+         FROM conversations
+         LEFT JOIN messages
+           ON messages.account_id = conversations.account_id
+          AND messages.conversation_id = conversations.id
+        WHERE conversations.account_id = $1
+          AND conversations.id = $2
+        GROUP BY conversations.id, conversations.display_id, conversations.inbox_id, conversations.status, conversations.last_activity_at
+        LIMIT 1`,
+      [provider.accountId, conversationId],
+    )) as {
+      rows: {
+        internal_id: number;
+        display_id: number;
+        inbox_id: number;
+        status: number;
+        last_activity_at: Date | null;
+        message_count: number;
+        attachment_message_count: number;
+        first_message_at: Date | null;
+        last_message_at: Date | null;
+      }[];
+    };
+
+    const row = result?.rows?.[0];
+    if (!row) {
+      return null;
+    }
+
+    return {
+      internalId: Number(row.internal_id),
+      displayId: Number(row.display_id),
+      inboxId: Number(row.inbox_id),
+      status: this.normalizeConversationStatus(row.status),
+      messageCount: Number(row.message_count || 0),
+      attachmentMessageCount: Number(row.attachment_message_count || 0),
+      firstMessageAt: row.first_message_at ? new Date(row.first_message_at).toISOString() : null,
+      lastMessageAt: row.last_message_at ? new Date(row.last_message_at).toISOString() : null,
+      lastActivityAt: row.last_activity_at ? new Date(row.last_activity_at).toISOString() : null,
+    };
   }
 
   public async createFreshConversation(

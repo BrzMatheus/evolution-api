@@ -8,12 +8,17 @@ export class ChatwootHistoryExecuteDto {
   mode: 'importDirect' | 'rebuild';
   selectionMode: 'allSafe' | 'selected';
   remoteJids?: string[];
+  conversationSelections?: {
+    remoteJid: string;
+    canonicalConversationId?: number;
+  }[];
 }
 
 export class ChatwootHistoryContactActionDto {
   jobId: string;
   remoteJid: string;
   action: 'importDirect' | 'createRebuild' | 'ignore' | 'openChatwootReview';
+  canonicalConversationId?: number;
 }
 
 export class ChatwootHistoryReprocessDto {

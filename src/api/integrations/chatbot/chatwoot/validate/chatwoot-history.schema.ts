@@ -34,6 +34,17 @@ export const chatwootHistoryExecuteSchema: JSONSchema7 = {
       type: 'array',
       items: { type: 'string', minLength: 1 },
     },
+    conversationSelections: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          remoteJid: { type: 'string', minLength: 1 },
+          canonicalConversationId: { type: 'number' },
+        },
+        required: ['remoteJid'],
+      },
+    },
   },
   required: ['jobId', 'mode', 'selectionMode'],
 };
@@ -48,6 +59,7 @@ export const chatwootHistoryContactActionSchema: JSONSchema7 = {
       type: 'string',
       enum: ['importDirect', 'createRebuild', 'ignore', 'openChatwootReview'],
     },
+    canonicalConversationId: { type: 'number' },
   },
   required: ['jobId', 'remoteJid', 'action'],
 };
