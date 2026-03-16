@@ -920,6 +920,42 @@ export class ChatwootHistoryService {
     });
   }
 
+  private hydrateEvolutionMessagesForImport(
+    messages: MessageModel[],
+    resolved: ReturnType<typeof resolveCanonicalJid>,
+  ): MessageModel[] {
+    return messages.map((message) => {
+      const rawKey =
+        message.key && typeof message.key === 'object' && !Array.isArray(message.key)
+          ? { ...(message.key as Record<string, unknown>) }
+          : {};
+
+      if (!rawKey.remoteJid && resolved.canonicalJid) {
+        rawKey.remoteJid = resolved.canonicalJid;
+      }
+      if (!rawKey.remoteJidAlt && resolved.phoneJid && rawKey.remoteJid !== resolved.phoneJid) {
+        rawKey.remoteJidAlt = resolved.phoneJid;
+      }
+      if (!rawKey.canonicalJid && resolved.canonicalJid) {
+        rawKey.canonicalJid = resolved.canonicalJid;
+      }
+      if (!rawKey.phoneJid && resolved.phoneJid) {
+        rawKey.phoneJid = resolved.phoneJid;
+      }
+      if (!rawKey.lidJid && resolved.lidJid) {
+        rawKey.lidJid = resolved.lidJid;
+      }
+
+      return {
+        ...message,
+        canonicalJid: message.canonicalJid || resolved.canonicalJid,
+        phoneJid: message.phoneJid || resolved.phoneJid,
+        lidJid: message.lidJid || resolved.lidJid,
+        key: rawKey as Prisma.JsonObject,
+      };
+    });
+  }
+
   private async findChatwootContact(
     instance: InstanceDto,
     remoteJid: string,
@@ -1088,7 +1124,10 @@ export class ChatwootHistoryService {
       phoneJid: contact.phoneJid,
       lidJid: contact.lidJid,
     });
-    const messages = await this.loadEvolutionMessages(instance, contact.remoteJid, resolved);
+    const messages = this.hydrateEvolutionMessagesForImport(
+      await this.loadEvolutionMessages(instance, contact.remoteJid, resolved),
+      resolved,
+    );
     if (messages.length === 0) {
       return this.updateExecutionContact(contact.id, {
         selectedAction,
@@ -1148,6 +1187,11 @@ export class ChatwootHistoryService {
           context.inboxId,
           contact.remoteJid,
           contact.pushName,
+          contact.selectedConversationId
+            ? Number(contact.selectedConversationId)
+            : Array.isArray(contact.candidateConversationIds) && contact.candidateConversationIds.length > 0
+              ? Number(contact.candidateConversationIds[0])
+              : null,
         );
         if (!rebuiltConversationId) {
           throw new Error('Unable to create rebuilt conversation');
@@ -1173,10 +1217,21 @@ export class ChatwootHistoryService {
         });
       }
 
-      await chatwootImport.importHistoryMessages(instance, this.chatwootService, context.inbox, context.provider, {
-        allowedPhoneNumbers: new Set([`+${phoneNumber}`]),
-        forceFksByPhoneNumber: forceFksByPhoneNumber.size > 0 ? forceFksByPhoneNumber : undefined,
-      });
+      const importedMessagesCount =
+        (await chatwootImport.importHistoryMessages(instance, this.chatwootService, context.inbox, context.provider, {
+          allowedPhoneNumbers: new Set([`+${phoneNumber}`]),
+          forceFksByPhoneNumber: forceFksByPhoneNumber.size > 0 ? forceFksByPhoneNumber : undefined,
+        })) || 0;
+
+      if (targetConversationId) {
+        await this.chatwootService.refreshHistoricalConversation(instance, targetConversationId, {
+          forceOpen: mode === 'rebuild',
+        });
+      }
+
+      if (mode === 'rebuild' && consolidationResult.movedMessageCount + importedMessagesCount === 0) {
+        throw new Error('Rebuild created a canonical conversation but no messages were materialized into it');
+      }
 
       const latestContact = await this.findChatwootContact(instance, contact.remoteJid, resolved);
       const latestConversation =
@@ -1207,6 +1262,9 @@ export class ChatwootHistoryService {
           ? `Unable to resolve superseded conversations: ${consolidationResult.failedConversationIds
               .map((conversationId) => `#${conversationId}`)
               .join(', ')}`
+          : null,
+        mode === 'rebuild' && importedMessagesCount === 0 && consolidationResult.movedMessageCount > 0
+          ? 'Rebuild preserved the Chatwoot conversation, but no Evolution messages were inserted into the canonical copy'
           : null,
       ].filter(Boolean);
 
@@ -1287,9 +1345,13 @@ export class ChatwootHistoryService {
     inboxId: number,
     remoteJid: string,
     pushName: string | null,
+    sourceConversationId: number | null,
   ) {
     const contactId = await this.resolveContactId(instance, remoteJid, pushName, inboxId);
-    const conversation = await this.chatwootService.createFreshConversation(instance, contactId, inboxId, true);
+    const conversation = await this.chatwootService.createHistoricalShadowConversation(instance, contactId, inboxId, {
+      sourceConversationId,
+      remoteJid,
+    });
     return conversation?.id ? Number(conversation.id) : null;
   }
 

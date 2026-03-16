@@ -44,6 +44,7 @@ interface ChatwootMessage {
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
+  private readonly CHATWOOT_STATUS_OPEN = 0;
   private readonly CHATWOOT_STATUS_RESOLVED = 1;
 
   // Lock polling delay
@@ -1176,6 +1177,90 @@ export class ChatwootService {
     return freshConversation as unknown as conversation;
   }
 
+  public async createHistoricalShadowConversation(
+    instance: InstanceDto,
+    contactId: number,
+    inboxId: number,
+    options?: {
+      sourceConversationId?: number | null;
+      remoteJid?: string | null;
+    },
+  ): Promise<conversation | null> {
+    const provider = await this.getProvider(instance);
+    if (!provider) {
+      return null;
+    }
+
+    const contactInboxRow = (await this.pgClient.query(
+      `SELECT id
+         FROM contact_inboxes
+        WHERE contact_id = $1
+          AND inbox_id = $2
+        ORDER BY id DESC
+        LIMIT 1`,
+      [contactId, inboxId],
+    )) as { rows: { id: number }[] };
+
+    const contactInboxId = contactInboxRow.rows[0]?.id;
+    if (!contactInboxId) {
+      this.logger.warn(
+        `Contact inbox not found for contact ${contactId} and inbox ${inboxId}, falling back to API conversation creation`,
+      );
+      return this.createFreshConversation(instance, contactId, inboxId, false);
+    }
+
+    let sourceAdditionalAttributes: Record<string, unknown> = {};
+    const sourceConversationId = Number(options?.sourceConversationId);
+
+    if (Number.isFinite(sourceConversationId) && sourceConversationId > 0) {
+      const sourceConversation = (await this.pgClient.query(
+        `SELECT additional_attributes
+           FROM conversations
+          WHERE account_id = $1
+            AND id = $2
+          LIMIT 1`,
+        [provider.accountId, sourceConversationId],
+      )) as { rows: { additional_attributes: Record<string, unknown> | null }[] };
+
+      const rawAdditionalAttributes = sourceConversation.rows[0]?.additional_attributes;
+      if (rawAdditionalAttributes && typeof rawAdditionalAttributes === 'object') {
+        sourceAdditionalAttributes = rawAdditionalAttributes;
+      }
+    }
+
+    const additionalAttributes = {
+      ...sourceAdditionalAttributes,
+      historical_import: true,
+      historical_import_source: 'evolution_api_rebuild_merge',
+      historical_import_jid: options?.remoteJid || null,
+      historical_import_origin_conversation_id:
+        Number.isFinite(sourceConversationId) && sourceConversationId > 0 ? sourceConversationId : null,
+      historical_import_preserve_chatwoot_media: true,
+    };
+
+    const insertedConversation = (await this.pgClient.query(
+      `INSERT INTO conversations
+         (account_id, inbox_id, status, contact_id, contact_inbox_id, uuid, last_activity_at, created_at, updated_at,
+          additional_attributes)
+       VALUES ($1, $2, $3, $4, $5, gen_random_uuid(), NOW(), NOW(), NOW(), $6::jsonb)
+       RETURNING *`,
+      [
+        provider.accountId,
+        inboxId,
+        this.CHATWOOT_STATUS_OPEN,
+        contactId,
+        contactInboxId,
+        JSON.stringify(additionalAttributes),
+      ],
+    )) as {
+      rows: (conversation & {
+        display_id?: number;
+      })[];
+    };
+
+    return (insertedConversation.rows[0] as unknown as conversation) || null;
+  }
+
   public async consolidateConversationHistory(
     instance: InstanceDto,
     targetConversationId: number,
@@ -1207,11 +1292,15 @@ export class ChatwootService {
     const movedMessageCount =
       (
         await this.pgClient.query(
-          `UPDATE messages
+          `UPDATE messages AS messages
               SET conversation_id = $1,
+                  inbox_id = target.inbox_id,
                   updated_at = NOW()
-            WHERE account_id = $2
-              AND conversation_id = ANY($3::integer[])`,
+             FROM conversations AS target
+            WHERE target.account_id = $2
+              AND target.id = $1
+              AND messages.account_id = $2
+              AND messages.conversation_id = ANY($3::integer[])`,
           [targetConversationId, provider.accountId, supersededConversationIds],
         )
       )?.rowCount || 0;
@@ -1290,6 +1379,75 @@ export class ChatwootService {
       resolvedConversationIds,
       failedConversationIds,
     };
+  }
+
+  public async refreshHistoricalConversation(
+    instance: InstanceDto,
+    conversationId: number,
+    options?: {
+      forceOpen?: boolean;
+    },
+  ) {
+    const provider = await this.getProvider(instance);
+    if (!provider || !conversationId) {
+      return null;
+    }
+
+    const aggregatesResult = (await this.pgClient.query(
+      `SELECT COUNT(*)::INTEGER AS total_messages,
+              MIN(created_at) AS first_message_at,
+              MAX(created_at) AS last_message_at,
+              MIN(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS first_reply_at,
+              MAX(created_at) FILTER (WHERE message_type = 0 AND private = FALSE) AS last_incoming_at,
+              MAX(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS last_outgoing_at
+         FROM messages
+        WHERE account_id = $1
+          AND conversation_id = $2`,
+      [provider.accountId, conversationId],
+    )) as {
+      rows: {
+        total_messages: number;
+        first_message_at: Date | null;
+        last_message_at: Date | null;
+        first_reply_at: Date | null;
+        last_incoming_at: Date | null;
+        last_outgoing_at: Date | null;
+      }[];
+    };
+
+    const aggregates = aggregatesResult.rows[0];
+    if (!aggregates) {
+      return null;
+    }
+
+    await this.pgClient.query(
+      `UPDATE conversations
+          SET status = CASE WHEN $3 THEN $4 ELSE status END,
+              created_at = COALESCE($5, created_at),
+              last_activity_at = COALESCE($6, last_activity_at, created_at),
+              first_reply_created_at = COALESCE($7, first_reply_created_at),
+              waiting_since = CASE
+                                WHEN $8 IS NULL THEN NULL
+                                WHEN $9 IS NULL OR $8 > $9 THEN $8
+                                ELSE NULL
+                              END,
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND id = $2`,
+      [
+        provider.accountId,
+        conversationId,
+        !!options?.forceOpen,
+        this.CHATWOOT_STATUS_OPEN,
+        aggregates.first_message_at,
+        aggregates.last_message_at,
+        aggregates.first_reply_at,
+        aggregates.last_incoming_at,
+        aggregates.last_outgoing_at,
+      ],
+    );
+
+    return aggregates;
   }
 
   public async countConversationMessages(instance: InstanceDto, conversationId: number): Promise<number> {
