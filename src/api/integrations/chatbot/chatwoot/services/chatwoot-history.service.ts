@@ -1129,6 +1129,18 @@ export class ChatwootHistoryService {
       let targetConversationId = contact.selectedConversationId ? Number(contact.selectedConversationId) : null;
       let rebuiltConversationId = contact.rebuiltConversationId ? Number(contact.rebuiltConversationId) : null;
       const forceFksByPhoneNumber = new Map<string, FksChatwoot>();
+      const aliases = getJidAliases({
+        remoteJid: contact.remoteJid,
+        canonicalJid: contact.canonicalJid || resolved.canonicalJid,
+        phoneJid: contact.phoneJid || resolved.phoneJid,
+        lidJid: contact.lidJid || resolved.lidJid,
+      });
+      let consolidationResult = {
+        movedMessageCount: 0,
+        supersededConversationIds: [] as number[],
+        resolvedConversationIds: [] as number[],
+        failedConversationIds: [] as number[],
+      };
 
       if (mode === 'rebuild') {
         rebuiltConversationId = await this.createRebuildConversation(
@@ -1141,6 +1153,12 @@ export class ChatwootHistoryService {
           throw new Error('Unable to create rebuilt conversation');
         }
         targetConversationId = rebuiltConversationId;
+
+        consolidationResult = await this.chatwootService.consolidateConversationHistory(
+          instance,
+          rebuiltConversationId,
+          Array.isArray(contact.candidateConversationIds) ? contact.candidateConversationIds.map(Number) : [],
+        );
       }
 
       if (targetConversationId) {
@@ -1169,6 +1187,9 @@ export class ChatwootHistoryService {
         mode === 'rebuild'
           ? rebuiltConversationId
           : targetConversationId || (latestConversation?.id ? Number(latestConversation.id) : null);
+      if (latestConversationId) {
+        await this.chatwootService.setConversationCacheForIdentifiers(instance, aliases, latestConversationId);
+      }
       const latestChatwootCount = latestConversationId
         ? await this.chatwootService.countConversationMessages(instance, latestConversationId)
         : contact.chatwootMessageCount;
@@ -1178,6 +1199,16 @@ export class ChatwootHistoryService {
         latestContact?.id ? Number(latestContact.id) : contact.chatwootContactId || null,
         latestConversationId,
       );
+      const executionWarnings = [
+        !isSafeForMode && allowUnsafeOverride
+          ? 'Explicit manual override executed despite direct import safety warnings'
+          : null,
+        mode === 'rebuild' && consolidationResult.failedConversationIds.length > 0
+          ? `Unable to resolve superseded conversations: ${consolidationResult.failedConversationIds
+              .map((conversationId) => `#${conversationId}`)
+              .join(', ')}`
+          : null,
+      ].filter(Boolean);
 
       return this.updateExecutionContact(contact.id, {
         selectedAction,
@@ -1194,10 +1225,11 @@ export class ChatwootHistoryService {
             executionError: null,
             rebuiltConversationId,
             reviewPayload,
-            executionWarning:
-              !isSafeForMode && allowUnsafeOverride
-                ? 'Explicit manual override executed despite direct import safety warnings'
-                : null,
+            executionWarning: executionWarnings.length > 0 ? executionWarnings.join(' | ') : null,
+            supersededConversationIds: consolidationResult.supersededConversationIds,
+            movedChatwootMessageCount: consolidationResult.movedMessageCount,
+            resolvedSupersededConversationIds: consolidationResult.resolvedConversationIds,
+            failedSupersededConversationIds: consolidationResult.failedConversationIds,
           }),
         ),
       });
@@ -1572,6 +1604,14 @@ export class ChatwootHistoryService {
         fallback: 'created_at_epoch + direction + normalized_content',
         collisionPreference: 'prefer_chatwoot',
       },
+      consolidation: {
+        strategy: 'create_new_canonical_and_resolve_sources',
+        candidateConversationIds: args.candidateConversationIds,
+        supersededConversationIds: [],
+        movedChatwootMessageCount: 0,
+        resolvedSupersededConversationIds: [],
+        failedSupersededConversationIds: [],
+      },
       executor: this.getExecutorDescriptor(),
       execution: {
         status: args.executionStatus,
@@ -1590,10 +1630,15 @@ export class ChatwootHistoryService {
       rebuiltConversationId: number | null;
       reviewPayload: ChatwootReviewPayload;
       executionWarning?: string | null;
+      supersededConversationIds?: number[];
+      movedChatwootMessageCount?: number;
+      resolvedSupersededConversationIds?: number[];
+      failedSupersededConversationIds?: number[];
     },
   ) {
     const existingDecision = this.asObject(report.decision);
     const execution = this.asObject(report.execution);
+    const consolidation = this.asObject(report.consolidation);
 
     return {
       ...report,
@@ -1608,6 +1653,23 @@ export class ChatwootHistoryService {
         error: args.executionError,
         warning: args.executionWarning || execution.warning || null,
         finishedAt: new Date().toISOString(),
+      },
+      consolidation: {
+        ...consolidation,
+        supersededConversationIds:
+          args.supersededConversationIds ||
+          (Array.isArray(consolidation.supersededConversationIds) ? consolidation.supersededConversationIds : []),
+        movedChatwootMessageCount: args.movedChatwootMessageCount ?? consolidation.movedChatwootMessageCount ?? 0,
+        resolvedSupersededConversationIds:
+          args.resolvedSupersededConversationIds ||
+          (Array.isArray(consolidation.resolvedSupersededConversationIds)
+            ? consolidation.resolvedSupersededConversationIds
+            : []),
+        failedSupersededConversationIds:
+          args.failedSupersededConversationIds ||
+          (Array.isArray(consolidation.failedSupersededConversationIds)
+            ? consolidation.failedSupersededConversationIds
+            : []),
       },
       review: args.reviewPayload,
       chatwootConversationUrl: args.reviewPayload.chatwootConversationId ? args.reviewPayload.chatwootReviewUrl : null,

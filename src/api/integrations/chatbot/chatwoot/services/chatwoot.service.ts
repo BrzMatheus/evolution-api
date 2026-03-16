@@ -44,6 +44,7 @@ interface ChatwootMessage {
 
 export class ChatwootService {
   private readonly logger = new Logger('ChatwootService');
+  private readonly CHATWOOT_STATUS_RESOLVED = 1;
 
   // Lock polling delay
   private readonly LOCK_POLLING_DELAY_MS = 300; // Delay between lock status checks
@@ -663,6 +664,44 @@ export class ChatwootService {
     return `${instance.instanceName}:lock:createConversation-${identifier}`;
   }
 
+  private sortConversationsByRecency<T extends { id?: number | null }>(conversations: T[]) {
+    return [...conversations].sort((left, right) => (right?.id || 0) - (left?.id || 0));
+  }
+
+  private pickPreferredInboxConversation(
+    conversations: conversation[],
+    inboxId: number,
+    options?: {
+      allowResolvedFallback?: boolean;
+    },
+  ) {
+    const inboxConversations = this.sortConversationsByRecency(
+      conversations.filter((item) => item?.inbox_id === inboxId),
+    );
+    const activeConversation = inboxConversations.find((item) => item?.status !== 'resolved');
+
+    if (activeConversation) {
+      return activeConversation;
+    }
+
+    return options?.allowResolvedFallback === false ? null : inboxConversations[0] || null;
+  }
+
+  public async setConversationCacheForIdentifiers(
+    instance: InstanceDto,
+    identifiers: (string | null | undefined)[],
+    conversationId: number,
+    ttlSeconds = 1800,
+  ) {
+    const uniqueIdentifiers = Array.from(new Set(identifiers.filter(Boolean)));
+
+    await Promise.all(
+      uniqueIdentifiers.map((identifier) =>
+        this.cache.set(this.getConversationCacheKey(instance, String(identifier)), conversationId, ttlSeconds),
+      ),
+    );
+  }
+
   private async syncCanonicalIdentifier(
     instance: InstanceDto,
     identity: ReturnType<ChatwootService['resolveWhatsappIdentity']>,
@@ -764,7 +803,7 @@ export class ChatwootService {
           this.logger.error(`Error getting conversation: ${error}`);
           conversationExists = false;
         }
-        if (!conversationExists) {
+        if (!conversationExists || conversationExists?.status === 'resolved') {
           this.logger.verbose('Conversation does not exist, re-calling createConversation');
           this.cache.delete(cacheKey);
           return await this.createConversation(instance, body);
@@ -908,13 +947,12 @@ export class ChatwootService {
           return null;
         }
 
-        let inboxConversation = contactConversations.payload.find(
-          (conversation) => conversation.inbox_id == filterInbox.id,
-        );
+        let inboxConversation = this.pickPreferredInboxConversation(contactConversations.payload, filterInbox.id);
         if (inboxConversation) {
           if (this.provider.reopenConversation) {
+            const inboxConversationDetails = inboxConversation as any;
             this.logger.verbose(
-              `Found conversation in reopenConversation mode: ID: ${inboxConversation.id} - Name: ${inboxConversation.meta.sender.name} - Identifier: ${inboxConversation.meta.sender.identifier}`,
+              `Found conversation in reopenConversation mode: ID: ${inboxConversation.id} - Name: ${inboxConversationDetails?.meta?.sender?.name} - Identifier: ${inboxConversationDetails?.meta?.sender?.identifier}`,
             );
             if (inboxConversation && this.provider.conversationPending && inboxConversation.status !== 'open') {
               await client.conversations.toggleStatus({
@@ -926,10 +964,9 @@ export class ChatwootService {
               });
             }
           } else {
-            inboxConversation = contactConversations.payload.find(
-              (conversation) =>
-                conversation && conversation.status !== 'resolved' && conversation.inbox_id == filterInbox.id,
-            );
+            inboxConversation = this.pickPreferredInboxConversation(contactConversations.payload, filterInbox.id, {
+              allowResolvedFallback: false,
+            });
             this.logger.verbose(`Found conversation: ${JSON.stringify(inboxConversation)}`);
           }
 
@@ -1101,11 +1138,7 @@ export class ChatwootService {
     inboxId: number,
   ): Promise<conversation | null> {
     const conversations = await this.listContactConversations(instance, contactId);
-    const inboxConversations = conversations
-      .filter((item) => item?.inbox_id === inboxId)
-      .sort((left, right) => (right?.id || 0) - (left?.id || 0));
-
-    return inboxConversations[0] || null;
+    return this.pickPreferredInboxConversation(conversations, inboxId);
   }
 
   public async createFreshConversation(
@@ -1141,6 +1174,122 @@ export class ChatwootService {
     }
 
     return freshConversation as unknown as conversation;
+  }
+
+  public async consolidateConversationHistory(
+    instance: InstanceDto,
+    targetConversationId: number,
+    sourceConversationIds: number[],
+  ): Promise<{
+    movedMessageCount: number;
+    supersededConversationIds: number[];
+    resolvedConversationIds: number[];
+    failedConversationIds: number[];
+  }> {
+    const provider = await this.getProvider(instance);
+    const supersededConversationIds = Array.from(
+      new Set(
+        sourceConversationIds
+          .map((value) => Number(value))
+          .filter((value) => Number.isFinite(value) && value > 0 && value !== targetConversationId),
+      ),
+    );
+
+    if (!provider || supersededConversationIds.length === 0) {
+      return {
+        movedMessageCount: 0,
+        supersededConversationIds,
+        resolvedConversationIds: [],
+        failedConversationIds: [],
+      };
+    }
+
+    const movedMessageCount =
+      (
+        await this.pgClient.query(
+          `UPDATE messages
+              SET conversation_id = $1,
+                  updated_at = NOW()
+            WHERE account_id = $2
+              AND conversation_id = ANY($3::integer[])`,
+          [targetConversationId, provider.accountId, supersededConversationIds],
+        )
+      )?.rowCount || 0;
+
+    await this.pgClient.query(
+      `UPDATE conversations
+          SET last_activity_at = COALESCE(
+                (SELECT MAX(created_at) FROM messages WHERE account_id = $1 AND conversation_id = $2),
+                last_activity_at
+              ),
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND id = $2`,
+      [provider.accountId, targetConversationId],
+    );
+
+    await this.pgClient.query(
+      `UPDATE conversations
+          SET last_activity_at = COALESCE(
+                (SELECT MAX(created_at) FROM messages WHERE account_id = $1 AND conversation_id = conversations.id),
+                conversations.created_at
+              ),
+              updated_at = NOW()
+        WHERE account_id = $1
+          AND id = ANY($2::integer[])`,
+      [provider.accountId, supersededConversationIds],
+    );
+
+    const client = await this.clientCw(instance);
+    const resolutionResults = await Promise.allSettled(
+      supersededConversationIds.map(async (conversationId) => {
+        if (client) {
+          try {
+            await client.conversations.toggleStatus({
+              accountId: this.provider.accountId,
+              conversationId,
+              data: {
+                status: 'resolved',
+              },
+            });
+            return conversationId;
+          } catch (error) {
+            this.logger.warn(`Conversation ${conversationId} resolve via API failed, applying DB fallback: ${error}`);
+          }
+        }
+
+        await this.pgClient.query(
+          `UPDATE conversations
+              SET status = $1,
+                  updated_at = NOW()
+            WHERE account_id = $2
+              AND id = $3`,
+          [this.CHATWOOT_STATUS_RESOLVED, provider.accountId, conversationId],
+        );
+
+        return conversationId;
+      }),
+    );
+
+    const resolvedConversationIds: number[] = [];
+    const failedConversationIds: number[] = [];
+
+    resolutionResults.forEach((result, index) => {
+      const conversationId = supersededConversationIds[index];
+      if (result.status === 'fulfilled') {
+        resolvedConversationIds.push(result.value);
+        return;
+      }
+
+      failedConversationIds.push(conversationId);
+    });
+
+    return {
+      movedMessageCount,
+      supersededConversationIds,
+      resolvedConversationIds,
+      failedConversationIds,
+    };
   }
 
   public async countConversationMessages(instance: InstanceDto, conversationId: number): Promise<number> {
