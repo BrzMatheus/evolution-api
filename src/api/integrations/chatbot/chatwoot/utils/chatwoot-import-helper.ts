@@ -6,6 +6,7 @@ import { Chatwoot, configService } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
 import { Chatwoot as ChatwootModel, Contact, Message } from '@prisma/client';
+import { getChatwootPhoneNumber, resolveCanonicalJid } from '@utils/whatsapp-jid';
 import { proto } from 'baileys';
 
 type ChatwootUser = {
@@ -45,6 +46,22 @@ type ConversationInspectionResult = {
   matchedCanonicalSourceIds: Set<string>;
   matchedFallbackSignatures: Set<string>;
   sourceIdCollisionRisk: boolean;
+};
+
+type MessageKeyCarrier = {
+  remoteJid?: string | null;
+  remoteJidAlt?: string | null;
+  canonicalJid?: string | null;
+  phoneJid?: string | null;
+  lidJid?: string | null;
+  id?: string | null;
+  fromMe?: boolean | null;
+};
+
+type HistoryMessageCarrier = Message & {
+  canonicalJid?: string | null;
+  phoneJid?: string | null;
+  lidJid?: string | null;
 };
 
 class ChatwootImport {
@@ -260,18 +277,13 @@ class ChatwootImport {
 
       // ordering messages by number and timestamp asc
       messagesOrdered.sort((a, b) => {
-        const aKey = a.key as {
-          remoteJid: string;
-        };
-
-        const bKey = b.key as {
-          remoteJid: string;
-        };
-
         const aMessageTimestamp = a.messageTimestamp as any as number;
         const bMessageTimestamp = b.messageTimestamp as any as number;
 
-        return parseInt(aKey.remoteJid) - parseInt(bKey.remoteJid) || aMessageTimestamp - bMessageTimestamp;
+        return (
+          this.getMessageConversationKey(a).localeCompare(this.getMessageConversationKey(b)) ||
+          aMessageTimestamp - bMessageTimestamp
+        );
       });
 
       const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
@@ -527,20 +539,20 @@ class ChatwootImport {
     allowedPhoneNumbers?: Set<string>,
   ): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
-      const key = message?.key as {
-        remoteJid: string;
-      };
-      if (!this.isIgnorePhoneNumber(key?.remoteJid)) {
-        const phoneNumber = key?.remoteJid?.split('@')[0];
-        if (phoneNumber) {
-          const phoneNumberPlus = `+${phoneNumber}`;
-          if (allowedPhoneNumbers && !allowedPhoneNumbers.has(phoneNumberPlus)) {
-            return acc;
-          }
-          const messages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
-          messages.push(message);
-          acc.set(phoneNumberPlus, messages);
+      const identity = this.getMessageIdentity(message);
+      if (!this.isIgnorePhoneNumber(identity.canonicalJid || identity.remoteJid || '')) {
+        const phoneNumber = this.getMessagePhoneNumber(message);
+        if (!phoneNumber) {
+          return acc;
         }
+
+        const phoneNumberPlus = `+${phoneNumber}`;
+        if (allowedPhoneNumbers && !allowedPhoneNumbers.has(phoneNumberPlus)) {
+          return acc;
+        }
+        const groupedMessages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
+        groupedMessages.push(message);
+        acc.set(phoneNumberPlus, groupedMessages);
       }
 
       return acc;
@@ -570,7 +582,8 @@ class ChatwootImport {
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
-    const contentMessage = chatwootService.getConversationMessage(msg.message);
+    const normalizedMessage = this.unwrapMessagePayload(msg.message as Record<string, any> | undefined);
+    const contentMessage = chatwootService.getConversationMessage(normalizedMessage);
     if (contentMessage) {
       return contentMessage;
     }
@@ -580,33 +593,33 @@ class ChatwootImport {
     }
 
     const types = {
-      documentMessage: msg.message.documentMessage,
-      documentWithCaptionMessage: msg.message.documentWithCaptionMessage?.message?.documentMessage,
-      imageMessage: msg.message.imageMessage,
-      videoMessage: msg.message.videoMessage,
-      audioMessage: msg.message.audioMessage,
-      stickerMessage: msg.message.stickerMessage,
-      templateMessage: msg.message.templateMessage?.hydratedTemplate?.hydratedContentText,
+      documentMessage: normalizedMessage.documentMessage,
+      documentWithCaptionMessage: normalizedMessage.documentWithCaptionMessage?.message?.documentMessage,
+      imageMessage: normalizedMessage.imageMessage,
+      videoMessage: normalizedMessage.videoMessage,
+      audioMessage: normalizedMessage.audioMessage,
+      stickerMessage: normalizedMessage.stickerMessage,
+      templateMessage: normalizedMessage.templateMessage?.hydratedTemplate?.hydratedContentText,
     };
 
     const typeKey = Object.keys(types).find((key) => types[key] !== undefined && types[key] !== null);
     switch (typeKey) {
       case 'documentMessage': {
-        const doc = msg.message.documentMessage;
+        const doc = normalizedMessage.documentMessage;
         const fileName = doc?.fileName || 'document';
         const caption = doc?.caption ? ` ${doc.caption}` : '';
         return `_<File: ${fileName}${caption}>_`;
       }
 
       case 'documentWithCaptionMessage': {
-        const doc = msg.message.documentWithCaptionMessage?.message?.documentMessage;
+        const doc = normalizedMessage.documentWithCaptionMessage?.message?.documentMessage;
         const fileName = doc?.fileName || 'document';
         const caption = doc?.caption ? ` ${doc.caption}` : '';
         return `_<File: ${fileName}${caption}>_`;
       }
 
       case 'templateMessage': {
-        const template = msg.message.templateMessage?.hydratedTemplate;
+        const template = normalizedMessage.templateMessage?.hydratedTemplate;
         return (
           (template?.hydratedTitleText ? `*${template.hydratedTitleText}*\n` : '') +
           (template?.hydratedContentText || '')
@@ -625,8 +638,18 @@ class ChatwootImport {
       case 'stickerMessage':
         return '_<Sticker Message>_';
 
-      default:
+      default: {
+        const rawTypeKey = Object.keys(normalizedMessage || {}).find(
+          (key) =>
+            normalizedMessage?.[key] !== undefined && normalizedMessage?.[key] !== null && key !== 'messageContextInfo',
+        );
+
+        if (rawTypeKey) {
+          return `_<${this.humanizeMessageType(rawTypeKey)}>_`;
+        }
+
         return '';
+      }
     }
   }
 
@@ -863,6 +886,71 @@ class ChatwootImport {
 
   private normalizeDirection(messageType: unknown): NormalizedDirection {
     return String(messageType) === '1' || String(messageType) === 'outgoing' ? 'outgoing' : 'incoming';
+  }
+
+  private unwrapMessagePayload(message?: Record<string, any>) {
+    let current = message || {};
+
+    for (let index = 0; index < 4; index += 1) {
+      if (current?.ephemeralMessage?.message) {
+        current = current.ephemeralMessage.message;
+        continue;
+      }
+
+      if (current?.viewOnceMessageV2?.message) {
+        current = current.viewOnceMessageV2.message;
+        continue;
+      }
+
+      if (current?.viewOnceMessage?.message) {
+        current = current.viewOnceMessage.message;
+        continue;
+      }
+
+      if (current?.viewOnceMessageV2Extension?.message) {
+        current = current.viewOnceMessageV2Extension.message;
+        continue;
+      }
+
+      break;
+    }
+
+    return current || {};
+  }
+
+  private humanizeMessageType(typeKey: string) {
+    return typeKey
+      .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+      .replace(/_/g, ' ')
+      .replace(/\b\w/g, (char) => char.toUpperCase());
+  }
+
+  private getMessageIdentity(message: Message) {
+    const key = ((message?.key || {}) as MessageKeyCarrier) || {};
+    const source = message as HistoryMessageCarrier;
+
+    return resolveCanonicalJid({
+      remoteJid: key.remoteJid,
+      remoteJidAlt: key.remoteJidAlt,
+      canonicalJid: key.canonicalJid || source.canonicalJid,
+      phoneJid: key.phoneJid || source.phoneJid,
+      lidJid: key.lidJid || source.lidJid,
+    });
+  }
+
+  private getMessagePhoneNumber(message: Message) {
+    const phoneNumber = getChatwootPhoneNumber(this.getMessageIdentity(message));
+    return phoneNumber ? String(phoneNumber).replace(/^\+/, '').split('@')[0] : null;
+  }
+
+  private getMessageConversationKey(message: Message) {
+    const phoneNumber = this.getMessagePhoneNumber(message);
+    if (phoneNumber) {
+      return phoneNumber;
+    }
+
+    const identity = this.getMessageIdentity(message);
+    return identity.canonicalJid || identity.remoteJid || '';
   }
 }
 
