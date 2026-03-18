@@ -22,7 +22,14 @@ import { request as chatwootRequest } from '@figuro/chatwoot-sdk/dist/core/reque
 import { Chatwoot as ChatwootModel, Contact as ContactModel, Message as MessageModel } from '@prisma/client';
 import i18next from '@utils/i18n';
 import { sendTelemetry } from '@utils/sendTelemetry';
-import { getChatwootIdentifier, getChatwootPhoneNumber, getJidAliases, resolveCanonicalJid } from '@utils/whatsapp-jid';
+import {
+  getChatwootIdentifier,
+  getChatwootPhoneNumber,
+  getJidAliases,
+  isTechnicalDisplayName,
+  resolveChatwootDisplayName,
+  resolveCanonicalJid,
+} from '@utils/whatsapp-jid';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
 import dayjs from 'dayjs';
@@ -776,6 +783,25 @@ export class ChatwootService {
     return updatedContact || phoneContact;
   }
 
+  private async findContactByWhatsappIdentity(
+    instance: InstanceDto,
+    identity: ReturnType<ChatwootService['resolveWhatsappIdentity']>,
+  ) {
+    for (const alias of identity.aliases) {
+      const byIdentifier = await this.findContactByIdentifier(instance, alias);
+      if (byIdentifier) {
+        return byIdentifier;
+      }
+    }
+
+    const phoneDigits = identity.phoneNumber?.split('@')[0].split(':')[0];
+    if (phoneDigits) {
+      return await this.findContact(instance, phoneDigits);
+    }
+
+    return null;
+  }
+
   public async createConversation(instance: InstanceDto, body: any) {
     const identity = this.resolveWhatsappIdentity(body);
     const isGroup = identity.isGroup;
@@ -789,27 +815,8 @@ export class ChatwootService {
 
     try {
       // Processa atualização de contatos já criados @lid
-      if (!identity.canonicalIdentifier && phoneNumber && remoteJid && !isGroup) {
-        const contact = await this.findContact(instance, phoneNumber.split('@')[0]);
-        if (contact && contact.identifier !== remoteJid) {
-          this.logger.verbose(
-            `Identifier needs update: (contact.identifier: ${contact.identifier}, phoneNumber: ${phoneNumber}, body.key.remoteJidAlt: ${remoteJid}`,
-          );
-          const updateContact = await this.updateContact(instance, contact.id, {
-            identifier: phoneNumber,
-            phone_number: `+${phoneNumber.split('@')[0]}`,
-          });
-
-          if (updateContact === null) {
-            const baseContact = await this.findContact(instance, phoneNumber.split('@')[0]);
-            if (baseContact) {
-              await this.mergeContacts(baseContact.id, contact.id);
-              this.logger.verbose(
-                `Merge contacts: (${baseContact.id}) ${baseContact.phone_number} and (${contact.id}) ${contact.phone_number}`,
-              );
-            }
-          }
-        }
+      if (!isGroup) {
+        await this.syncCanonicalIdentifier(instance, identity);
       }
       this.logger.verbose(`--- Start createConversation ---`);
       this.logger.verbose(`Instance: ${JSON.stringify(instance)}`);
@@ -871,9 +878,11 @@ export class ChatwootService {
         }
 
         const chatId = isGroup ? remoteJid : phoneNumber.split('@')[0].split(':')[0];
-        let nameContact = !body.key.fromMe ? body.pushName : chatId;
         const filterInbox = await this.getInbox(instance);
         if (!filterInbox) return null;
+
+        // Display name for the group contact itself (used in createContact below)
+        let groupDisplayName: string | undefined;
 
         if (isGroup) {
           this.logger.verbose(`Processing group conversation`);
@@ -884,32 +893,39 @@ export class ChatwootService {
             identity.lidJid && !body.key.fromMe && body.key.participantAlt
               ? body.key.participantAlt
               : body.key.participant;
-          nameContact = `${group.subject} (GROUP)`;
+          groupDisplayName = `${group.subject} (GROUP)`;
 
           const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(
             participantJid.split('@')[0],
           );
           this.logger.verbose(`Participant profile picture URL: ${JSON.stringify(picture_url)}`);
 
-          const findParticipant = await this.findContact(instance, participantJid.split('@')[0]);
+          const participantPhoneNumber = participantJid.split('@')[0].split(':')[0];
+          const findParticipant = await this.findContact(instance, participantPhoneNumber);
 
           if (findParticipant) {
             this.logger.verbose(
               `Found participant: ID:${findParticipant.id} - Name: ${findParticipant.name} - identifier: ${findParticipant.identifier}`,
             );
-            if (!findParticipant.name || findParticipant.name === chatId) {
+            if (isTechnicalDisplayName(findParticipant.name, [participantPhoneNumber])) {
               await this.updateContact(instance, findParticipant.id, {
-                name: body.pushName,
+                name: resolveChatwootDisplayName({
+                  pushName: body.pushName,
+                  phoneNumber: participantPhoneNumber,
+                }),
                 avatar_url: picture_url.profilePictureUrl || null,
               });
             }
           } else {
             await this.createContact(
               instance,
-              participantJid.split('@')[0].split(':')[0],
+              participantPhoneNumber,
               filterInbox.id,
               false,
-              body.pushName,
+              resolveChatwootDisplayName({
+                pushName: body.pushName,
+                phoneNumber: participantPhoneNumber,
+              }),
               picture_url.profilePictureUrl || null,
               participantJid,
             );
@@ -919,13 +935,8 @@ export class ChatwootService {
         const picture_url = await this.waMonitor.waInstances[instance.instanceName].profilePicture(chatId);
         this.logger.verbose(`Contact profile picture URL: ${JSON.stringify(picture_url)}`);
 
-        this.logger.verbose(`Searching contact for canonical identifier: ${remoteJid}`);
-        let contact = !isGroup ? await this.findContactByIdentifier(instance, remoteJid) : null;
-
-        if (!contact) {
-          this.logger.verbose(`Fallback to phone search for: ${chatId}`);
-          contact = await this.findContact(instance, chatId);
-        }
+        this.logger.verbose(`Searching contact for identity aliases: ${identity.aliases.join(', ') || remoteJid}`);
+        let contact = !isGroup ? await this.findContactByWhatsappIdentity(instance, identity) : null;
 
         if (contact) {
           this.logger.verbose(`Found contact: ID:${contact.id} - Name:${contact.name}`);
@@ -934,12 +945,19 @@ export class ChatwootService {
               picture_url?.profilePictureUrl?.split('#')[0].split('?')[0].split('/').pop() || '';
             const chatwootProfilePictureFile = contact?.thumbnail?.split('#')[0].split('?')[0].split('/').pop() || '';
             const pictureNeedsUpdate = waProfilePictureFile !== chatwootProfilePictureFile;
-            const nameNeedsUpdate = !contact.name || contact.name === chatId;
+            const nameNeedsUpdate = isTechnicalDisplayName(contact.name, identity.aliases);
             this.logger.verbose(`Picture needs update: ${pictureNeedsUpdate}`);
             this.logger.verbose(`Name needs update: ${nameNeedsUpdate}`);
             if (pictureNeedsUpdate || nameNeedsUpdate) {
               contact = await this.updateContact(instance, contact.id, {
-                ...(nameNeedsUpdate && { name: nameContact }),
+                ...(nameNeedsUpdate && {
+                  name: resolveChatwootDisplayName({
+                    pushName: body.pushName,
+                    phoneNumber: chatId,
+                    currentName: contact.name,
+                    identifiers: identity.aliases,
+                  }),
+                }),
                 ...(waProfilePictureFile === '' && { avatar: null }),
                 ...(pictureNeedsUpdate && { avatar_url: picture_url?.profilePictureUrl }),
               });
@@ -951,7 +969,13 @@ export class ChatwootService {
             chatId,
             filterInbox.id,
             isGroup,
-            nameContact,
+            isGroup
+              ? groupDisplayName
+              : resolveChatwootDisplayName({
+                  pushName: body.pushName,
+                  phoneNumber: chatId,
+                  identifiers: identity.aliases,
+                }),
             picture_url.profilePictureUrl || null,
             remoteJid,
           );
@@ -1000,7 +1024,7 @@ export class ChatwootService {
 
           if (inboxConversation) {
             this.logger.verbose(`Returning existing conversation ID: ${inboxConversation.id}`);
-            this.cache.set(cacheKey, inboxConversation.id, 1800);
+            await this.setConversationCacheForIdentifiers(instance, identity.aliases, inboxConversation.id, 1800);
             return inboxConversation.id;
           }
         }
@@ -1025,7 +1049,7 @@ export class ChatwootService {
         }
 
         this.logger.verbose(`New conversation created of ${remoteJid} with ID: ${conversation.id}`);
-        this.cache.set(cacheKey, conversation.id, 1800);
+        await this.setConversationCacheForIdentifiers(instance, identity.aliases, conversation.id, 1800);
         return conversation.id;
       } finally {
         await this.cache.delete(lockKey);

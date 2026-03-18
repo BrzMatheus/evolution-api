@@ -22,7 +22,7 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { Logger } from '@config/logger.config';
 import { BadRequestException, NotFoundException } from '@exceptions';
 import { Chatwoot as ChatwootModel, Message as MessageModel, Prisma } from '@prisma/client';
-import { getJidAliases, resolveCanonicalJid } from '@utils/whatsapp-jid';
+import { getChatwootPhoneNumber, getJidAliases, resolveChatwootDisplayName, resolveCanonicalJid } from '@utils/whatsapp-jid';
 
 type JobMode = 'dryRun' | 'importDirect' | 'rebuild';
 type JobStatus = 'pending' | 'analyzing' | 'awaiting_execution' | 'running' | 'completed' | 'failed' | 'partial';
@@ -1183,7 +1183,10 @@ export class ChatwootHistoryService {
       }),
     ]);
 
-    return contact?.pushName || chat?.name || remoteJid.split('@')[0];
+    // Prefer stored pushName or chat name; fall back to the phone-only digits to
+    // avoid exposing a LID hex string (e.g. "abc123@lid" local part) as a name.
+    const phoneDigits = getChatwootPhoneNumber({ remoteJid }) ?? remoteJid.split('@')[0];
+    return contact?.pushName || chat?.name || phoneDigits;
   }
 
   private async executeContact(
@@ -1473,7 +1476,11 @@ export class ChatwootHistoryService {
       phoneNumber,
       inboxId,
       false,
-      pushName || phoneNumber,
+      resolveChatwootDisplayName({
+        pushName,
+        phoneNumber,
+        identifiers: [resolved.canonicalJid || remoteJid],
+      }),
       null,
       resolved.canonicalJid || remoteJid,
     );

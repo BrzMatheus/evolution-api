@@ -332,6 +332,34 @@ export DATABASE_PROVIDER=postgresql  # or mysql
 - **API documentation**: Document all public endpoints
 - **Integration guides**: Document new integration patterns
 - **Migration guides**: Document database schema changes
+- **Change memory**: Follow `docs/change-documentation.md` whenever behavior, contracts, flows, mapping rules, or integration assumptions are changed
+
+## Change Documentation Workflow
+
+### Mandatory Rule
+- **ALWAYS** document meaningful code changes, even when the user does not ask explicitly
+- **KEEP IT CONCISE**: Prefer short decision records over long narratives
+- **DOCUMENT BEFORE FORGETTING**: Update docs in the same change when context is still fresh
+
+### When Documentation Is Required
+- **Behavior changes**: Different runtime behavior, message routing, retries, defaults, or side effects
+- **Contract changes**: DTOs, API payloads, webhook payloads, return shapes, field semantics
+- **Mapping changes**: JID resolution, identifier normalization, alias rules, tenant scoping, ownership rules
+- **Integration changes**: WhatsApp providers, Chatwoot, OpenAI, Dify, queues, storage, webhooks
+- **Operational changes**: Environment variables, migrations, deployment steps, observability, failover
+
+### Default Documentation Targets
+- **Primary guide**: `docs/change-documentation.md`
+- **Breaking changes**: `CHANGELOG.md`
+- **Public behavior**: `README.md` or integration-specific docs when applicable
+- **Complex code paths**: Add short inline comments near the critical logic
+
+### Documentation Minimum
+- **What changed**
+- **Why it changed**
+- **Impact / risk**
+- **Files or flows affected**
+- **Follow-up needed**, if any
 
 ## Performance & Scalability
 

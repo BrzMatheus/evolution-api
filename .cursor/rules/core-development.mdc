@@ -102,6 +102,8 @@ alwaysApply: true
 - **API Documentation**: Document all public endpoints
 - **README**: Keep project documentation updated
 - **Changelog**: Document breaking changes
+- **Change Memory**: Follow `docs/change-documentation.md` for meaningful behavior and contract changes
+- **Default Behavior**: Document meaningful changes even when the user does not request documentation explicitly
 
 ## Quality Assurance
 

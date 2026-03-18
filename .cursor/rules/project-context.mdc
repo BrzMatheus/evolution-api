@@ -77,6 +77,8 @@ alwaysApply: true
 - **CHANGELOG**: Document breaking changes
 - **MIGRATION GUIDES**: Document database migrations
 - **INTEGRATION GUIDES**: Document new integration patterns
+- **CHANGE MEMORY**: Follow `docs/change-documentation.md` for concise records of behavior, mapping, contract, and integration changes
+- **DEFAULT EXPECTATION**: Documentation is part of the implementation, not an optional follow-up
 
 ## Environment and Security
 
