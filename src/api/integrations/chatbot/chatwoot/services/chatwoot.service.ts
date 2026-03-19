@@ -1709,6 +1709,8 @@ export class ChatwootService {
       return null;
     }
 
+    const toDate = (val: unknown): Date | null => (val ? new Date(val as string) : null);
+
     await this.pgClient.query(
       `UPDATE conversations
           SET status = CASE WHEN $3 THEN $4 ELSE status END,
@@ -1716,8 +1718,8 @@ export class ChatwootService {
               last_activity_at = COALESCE($6, last_activity_at, created_at),
               first_reply_created_at = COALESCE($7, first_reply_created_at),
               waiting_since = CASE
-                                WHEN $8::timestamp IS NULL THEN NULL
-                                WHEN $9::timestamp IS NULL OR $8::timestamp > $9::timestamp THEN $8::timestamp
+                                WHEN $8 IS NULL THEN NULL
+                                WHEN $9 IS NULL OR $8 > $9 THEN $8
                                 ELSE NULL
                               END,
               updated_at = NOW()
@@ -1728,11 +1730,11 @@ export class ChatwootService {
         conversationId,
         !!options?.forceOpen,
         this.CHATWOOT_STATUS_OPEN,
-        aggregates.first_message_at,
-        aggregates.last_message_at,
-        aggregates.first_reply_at,
-        aggregates.last_incoming_at,
-        aggregates.last_outgoing_at,
+        toDate(aggregates.first_message_at),
+        toDate(aggregates.last_message_at),
+        toDate(aggregates.first_reply_at),
+        toDate(aggregates.last_incoming_at),
+        toDate(aggregates.last_outgoing_at),
       ],
     );
 
