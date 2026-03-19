@@ -43,6 +43,24 @@ export function classifyChatwootHistoryContact(
     };
   }
 
+  const isCompleteOverlap = args.overlapCount >= args.evolutionMessageCount && args.evolutionMessageCount > 0;
+
+  // Complete overlap with single candidate, resolved identity, no LID alias = safe no-op
+  if (
+    isCompleteOverlap &&
+    args.candidateConversationCount === 1 &&
+    !args.hasLidAlias &&
+    args.canonicalIdentityType === 's_whatsapp_net' &&
+    args.identityResolutionStatus === 'resolved'
+  ) {
+    return {
+      classification: 'eligible',
+      suggestedAction: 'import_direct',
+      isSafeDirectImport: true,
+      unsafeReasons: [],
+    };
+  }
+
   const unsafeReasons = new Set<UnsafeReason>();
 
   if (args.hasLidAlias) {
@@ -53,15 +71,18 @@ export function classifyChatwootHistoryContact(
     unsafeReasons.add('multiple_candidate_conversations');
   }
 
-  if (args.overlapCount > 0) {
+  // Only partial overlap is risky; complete overlap is a no-op
+  if (args.overlapCount > 0 && args.overlapCount < args.evolutionMessageCount) {
     unsafeReasons.add('existing_conversation_overlap');
   }
 
-  if (args.sourceIdCollisionRisk) {
+  // Collision risk is moot when all messages already exist in Chatwoot
+  if (args.sourceIdCollisionRisk && !isCompleteOverlap) {
     unsafeReasons.add('source_id_collision_risk');
   }
 
-  if (args.chatwootMessageCount > 0) {
+  // Only flag history as unsafe when combined with other risk factors
+  if (args.chatwootMessageCount > 0 && (args.candidateConversationCount > 1 || args.hasLidAlias)) {
     unsafeReasons.add('chatwoot_history_already_present');
   }
 
@@ -89,7 +110,12 @@ export function classifyChatwootHistoryContact(
   ) {
     return {
       classification: 'needs_review',
-      suggestedAction: args.candidateConversationCount > 0 ? 'create_rebuild' : 'open_chatwoot',
+      suggestedAction:
+        args.candidateConversationCount === 1 && !args.hasLidAlias
+          ? 'import_direct'
+          : args.candidateConversationCount > 0
+            ? 'create_rebuild'
+            : 'open_chatwoot',
       isSafeDirectImport,
       unsafeReasons: unsafeReasonList,
     };
