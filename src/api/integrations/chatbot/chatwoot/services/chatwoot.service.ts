@@ -1716,8 +1716,8 @@ export class ChatwootService {
               last_activity_at = COALESCE($6, last_activity_at, created_at),
               first_reply_created_at = COALESCE($7, first_reply_created_at),
               waiting_since = CASE
-                                WHEN $8 IS NULL THEN NULL
-                                WHEN $9 IS NULL OR $8 > $9 THEN $8
+                                WHEN $8::timestamp IS NULL THEN NULL
+                                WHEN $9::timestamp IS NULL OR $8::timestamp > $9::timestamp THEN $8::timestamp
                                 ELSE NULL
                               END,
               updated_at = NOW()
