@@ -831,9 +831,10 @@ export class ChatwootHistoryService {
     remoteJid: string,
     context: HistoryAnalysisContext,
   ): Promise<ContactAnalysis> {
-    const resolved = resolveCanonicalJid({ remoteJid });
-    const identity = this.resolveIdentityMetadata(resolved);
+    let resolved = resolveCanonicalJid({ remoteJid });
     const evolutionMessages = await this.loadEvolutionMessages(instance, remoteJid, resolved);
+    resolved = await this.enrichResolvedWithPhone(resolved, remoteJid, evolutionMessages);
+    const identity = this.resolveIdentityMetadata(resolved);
     const chatwootContact = await this.findChatwootContact(instance, remoteJid, resolved);
     const conversationMetrics = await this.loadConversationMetrics(
       instance,
@@ -968,6 +969,49 @@ export class ChatwootHistoryService {
       },
       orderBy: { messageTimestamp: 'asc' },
     });
+  }
+
+  private resolvePhoneFromMessages(messages: MessageModel[]): string | null {
+    for (const msg of messages) {
+      if (msg.phoneJid && msg.phoneJid.endsWith('@s.whatsapp.net')) {
+        return msg.phoneJid;
+      }
+      const key =
+        msg.key && typeof msg.key === 'object' && !Array.isArray(msg.key) ? (msg.key as Record<string, unknown>) : null;
+      if (key) {
+        for (const field of ['remoteJid', 'remoteJidAlt', 'phoneJid']) {
+          const val = key[field];
+          if (typeof val === 'string' && val.endsWith('@s.whatsapp.net')) {
+            return val;
+          }
+        }
+      }
+    }
+    return null;
+  }
+
+  private async resolvePhoneFromIsOnWhatsapp(lidJid: string | null): Promise<string | null> {
+    if (!lidJid) return null;
+    try {
+      const entry = await this.prismaRepository.isOnWhatsapp.findFirst({
+        where: { lid: lidJid } as any,
+      });
+      return entry?.remoteJid && entry.remoteJid.endsWith('@s.whatsapp.net') ? entry.remoteJid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async enrichResolvedWithPhone(
+    resolved: ReturnType<typeof resolveCanonicalJid>,
+    remoteJid: string,
+    messages: MessageModel[],
+  ): Promise<ReturnType<typeof resolveCanonicalJid>> {
+    if (resolved.phoneJid) return resolved;
+    const inferred =
+      this.resolvePhoneFromMessages(messages) || (await this.resolvePhoneFromIsOnWhatsapp(resolved.lidJid));
+    if (!inferred) return resolved;
+    return resolveCanonicalJid({ remoteJid, phoneJid: inferred, lidJid: resolved.lidJid });
   }
 
   private hydrateEvolutionMessagesForImport(
@@ -1222,16 +1266,15 @@ export class ChatwootHistoryService {
       });
     }
 
-    const resolved = resolveCanonicalJid({
+    let resolved = resolveCanonicalJid({
       remoteJid: contact.remoteJid,
       canonicalJid: contact.canonicalJid,
       phoneJid: contact.phoneJid,
       lidJid: contact.lidJid,
     });
-    const messages = this.hydrateEvolutionMessagesForImport(
-      await this.loadEvolutionMessages(instance, contact.remoteJid, resolved),
-      resolved,
-    );
+    const rawMessages = await this.loadEvolutionMessages(instance, contact.remoteJid, resolved);
+    resolved = await this.enrichResolvedWithPhone(resolved, contact.remoteJid, rawMessages);
+    const messages = this.hydrateEvolutionMessagesForImport(rawMessages, resolved);
     if (messages.length === 0) {
       return this.updateExecutionContact(contact.id, {
         selectedAction,
