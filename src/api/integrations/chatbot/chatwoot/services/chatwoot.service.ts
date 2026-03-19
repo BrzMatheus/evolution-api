@@ -1683,16 +1683,35 @@ export class ChatwootService {
     }
 
     const aggregatesResult = (await this.pgClient.query(
-      `SELECT COUNT(*)::INTEGER AS total_messages,
-              MIN(created_at) AS first_message_at,
-              MAX(created_at) AS last_message_at,
-              MIN(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS first_reply_at,
-              MAX(created_at) FILTER (WHERE message_type = 0 AND private = FALSE) AS last_incoming_at,
-              MAX(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS last_outgoing_at
-         FROM messages
-        WHERE account_id = $1
-          AND conversation_id = $2`,
-      [provider.accountId, conversationId],
+      `WITH agg AS (
+        SELECT COUNT(*)::INTEGER AS total_messages,
+               MIN(created_at) AS first_message_at,
+               MAX(created_at) AS last_message_at,
+               MIN(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS first_reply_at,
+               MAX(created_at) FILTER (WHERE message_type = 0 AND private = FALSE) AS last_incoming_at,
+               MAX(created_at) FILTER (WHERE message_type = 1 AND private = FALSE) AS last_outgoing_at
+          FROM messages
+         WHERE account_id = $1
+           AND conversation_id = $2
+      ),
+      upd AS (
+        UPDATE conversations c
+           SET status = CASE WHEN $3 THEN $4 ELSE c.status END,
+               created_at = COALESCE(agg.first_message_at, c.created_at),
+               last_activity_at = COALESCE(agg.last_message_at, c.last_activity_at, c.created_at),
+               first_reply_created_at = COALESCE(agg.first_reply_at, c.first_reply_created_at),
+               waiting_since = CASE
+                                 WHEN agg.last_incoming_at IS NULL THEN NULL
+                                 WHEN agg.last_outgoing_at IS NULL OR agg.last_incoming_at > agg.last_outgoing_at THEN agg.last_incoming_at
+                                 ELSE NULL
+                               END,
+               updated_at = NOW()
+          FROM agg
+         WHERE c.account_id = $1
+           AND c.id = $2
+      )
+      SELECT * FROM agg`,
+      [provider.accountId, conversationId, !!options?.forceOpen, this.CHATWOOT_STATUS_OPEN],
     )) as {
       rows: {
         total_messages: number;
@@ -1708,35 +1727,6 @@ export class ChatwootService {
     if (!aggregates) {
       return null;
     }
-
-    const toDate = (val: unknown): Date | null => (val ? new Date(val as string) : null);
-
-    await this.pgClient.query(
-      `UPDATE conversations
-          SET status = CASE WHEN $3 THEN $4 ELSE status END,
-              created_at = COALESCE($5, created_at),
-              last_activity_at = COALESCE($6, last_activity_at, created_at),
-              first_reply_created_at = COALESCE($7, first_reply_created_at),
-              waiting_since = CASE
-                                WHEN $8 IS NULL THEN NULL
-                                WHEN $9 IS NULL OR $8 > $9 THEN $8
-                                ELSE NULL
-                              END,
-              updated_at = NOW()
-        WHERE account_id = $1
-          AND id = $2`,
-      [
-        provider.accountId,
-        conversationId,
-        !!options?.forceOpen,
-        this.CHATWOOT_STATUS_OPEN,
-        toDate(aggregates.first_message_at),
-        toDate(aggregates.last_message_at),
-        toDate(aggregates.first_reply_at),
-        toDate(aggregates.last_incoming_at),
-        toDate(aggregates.last_outgoing_at),
-      ],
-    );
 
     return aggregates;
   }
