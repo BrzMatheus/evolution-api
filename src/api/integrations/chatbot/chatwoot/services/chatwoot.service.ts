@@ -1618,33 +1618,12 @@ export class ChatwootService {
       [provider.accountId, supersededConversationIds],
     );
 
-    const client = await this.clientCw(instance);
-    const resolutionResults = await Promise.allSettled(
+    const deletionResults = await Promise.allSettled(
       supersededConversationIds.map(async (conversationId) => {
-        if (client) {
-          try {
-            await client.conversations.toggleStatus({
-              accountId: this.provider.accountId,
-              conversationId,
-              data: {
-                status: 'resolved',
-              },
-            });
-            return conversationId;
-          } catch (error) {
-            this.logger.warn(`Conversation ${conversationId} resolve via API failed, applying DB fallback: ${error}`);
-          }
-        }
-
-        await this.pgClient.query(
-          `UPDATE conversations
-              SET status = $1,
-                  updated_at = NOW()
-            WHERE account_id = $2
-              AND id = $3`,
-          [this.CHATWOOT_STATUS_RESOLVED, provider.accountId, conversationId],
-        );
-
+        await this.pgClient.query(`DELETE FROM conversations WHERE account_id = $1 AND id = $2`, [
+          provider.accountId,
+          conversationId,
+        ]);
         return conversationId;
       }),
     );
@@ -1652,13 +1631,16 @@ export class ChatwootService {
     const resolvedConversationIds: number[] = [];
     const failedConversationIds: number[] = [];
 
-    resolutionResults.forEach((result, index) => {
+    deletionResults.forEach((result, index) => {
       const conversationId = supersededConversationIds[index];
       if (result.status === 'fulfilled') {
         resolvedConversationIds.push(result.value);
         return;
       }
 
+      this.logger.warn(
+        `Failed to delete superseded conversation ${conversationId}: ${(result as PromiseRejectedResult).reason}`,
+      );
       failedConversationIds.push(conversationId);
     });
 
