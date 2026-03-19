@@ -1757,9 +1757,8 @@ export class ChatwootHistoryService {
   private resolveExecutionJobStatus(summary: JobSummary): JobStatus {
     const completed = summary.completed || 0;
     const failed = summary.failed || 0;
-    const skipped = summary.skipped || 0;
 
-    if (failed === 0 && skipped === 0) {
+    if (failed === 0) {
       return 'completed';
     }
 
@@ -1767,7 +1766,7 @@ export class ChatwootHistoryService {
       return 'partial';
     }
 
-    return failed > 0 ? 'failed' : 'partial';
+    return 'failed';
   }
 
   private resolveIdentityMetadata(resolved: ReturnType<typeof resolveCanonicalJid>) {
