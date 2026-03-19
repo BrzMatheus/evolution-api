@@ -27,8 +27,8 @@ import {
   getChatwootPhoneNumber,
   getJidAliases,
   isTechnicalDisplayName,
-  resolveChatwootDisplayName,
   resolveCanonicalJid,
+  resolveChatwootDisplayName,
 } from '@utils/whatsapp-jid';
 import axios from 'axios';
 import { WAMessageContent, WAMessageKey } from 'baileys';
@@ -1545,6 +1545,55 @@ export class ChatwootService {
         )
       )?.rowCount || 0;
 
+    // Deduplicate messages by source_id within the target conversation, preferring
+    // the copy that has attachments (audio, video, image). If neither has attachments,
+    // keep the one with the lower id (first imported). This handles the scenario where
+    // a past bad import created two conversations for the same contact, one with media
+    // and one without.
+    await this.pgClient.query(
+      `DELETE FROM messages
+        WHERE account_id = $1
+          AND conversation_id = $2
+          AND source_id IS NOT NULL
+          AND id NOT IN (
+            SELECT DISTINCT ON (source_id)
+              -- prefer message with attachments; break ties by lowest id
+              m.id
+            FROM messages m
+            LEFT JOIN attachments a ON a.message_id = m.id
+            WHERE m.account_id = $1
+              AND m.conversation_id = $2
+              AND m.source_id IS NOT NULL
+            ORDER BY source_id,
+                     (a.id IS NOT NULL) DESC,
+                     m.id ASC
+          )`,
+      [provider.accountId, targetConversationId],
+    );
+
+    // Deduplicate messages without source_id using a fallback fingerprint:
+    // message_type + md5(content) + timestamp truncated to the minute.
+    // Same preference: keep the copy with attachments, then lowest id.
+    await this.pgClient.query(
+      `DELETE FROM messages
+        WHERE account_id = $1
+          AND conversation_id = $2
+          AND source_id IS NULL
+          AND id NOT IN (
+            SELECT DISTINCT ON (m.message_type, md5(COALESCE(m.content, '')), date_trunc('minute', m.created_at))
+              m.id
+            FROM messages m
+            LEFT JOIN attachments a ON a.message_id = m.id
+            WHERE m.account_id = $1
+              AND m.conversation_id = $2
+              AND m.source_id IS NULL
+            ORDER BY m.message_type, md5(COALESCE(m.content, '')), date_trunc('minute', m.created_at),
+                     (a.id IS NOT NULL) DESC,
+                     m.id ASC
+          )`,
+      [provider.accountId, targetConversationId],
+    );
+
     await this.pgClient.query(
       `UPDATE conversations
           SET last_activity_at = COALESCE(
@@ -1856,6 +1905,57 @@ export class ChatwootService {
       return data;
     } catch (error) {
       this.logger.error(error);
+    }
+  }
+
+  public async sendHistoryMediaMessage(options: {
+    conversationId: number;
+    fileStream: Readable;
+    fileName: string;
+    messageType: 'incoming' | 'outgoing';
+    content?: string;
+    sourceId?: string;
+    timestamp?: number;
+  }): Promise<any> {
+    const data = new FormData();
+
+    if (options.content) {
+      data.append('content', options.content);
+    }
+
+    data.append('message_type', options.messageType);
+    data.append('attachments[]', options.fileStream, { filename: options.fileName });
+
+    if (options.sourceId) {
+      data.append('source_id', options.sourceId);
+    }
+
+    const config = {
+      method: 'post',
+      maxBodyLength: Infinity,
+      url: `${this.provider.url}/api/v1/accounts/${this.provider.accountId}/conversations/${options.conversationId}/messages`,
+      headers: {
+        api_access_token: this.provider.token,
+        ...data.getHeaders(),
+      },
+      data: data,
+    };
+
+    try {
+      const { data: responseData } = await axios.request(config);
+
+      // If we have the original timestamp, update created_at to preserve chronological order
+      if (options.timestamp && responseData?.id) {
+        await this.pgClient.query(
+          `UPDATE messages SET created_at = to_timestamp($1), updated_at = to_timestamp($1) WHERE id = $2`,
+          [options.timestamp, responseData.id],
+        );
+      }
+
+      return responseData;
+    } catch (error) {
+      this.logger.error(`Error sending history media message: ${error}`);
+      return null;
     }
   }
 

@@ -22,7 +22,12 @@ import { PrismaRepository } from '@api/repository/repository.service';
 import { Logger } from '@config/logger.config';
 import { BadRequestException, NotFoundException } from '@exceptions';
 import { Chatwoot as ChatwootModel, Message as MessageModel, Prisma } from '@prisma/client';
-import { getChatwootPhoneNumber, getJidAliases, resolveChatwootDisplayName, resolveCanonicalJid } from '@utils/whatsapp-jid';
+import {
+  getChatwootPhoneNumber,
+  getJidAliases,
+  resolveCanonicalJid,
+  resolveChatwootDisplayName,
+} from '@utils/whatsapp-jid';
 
 type JobMode = 'dryRun' | 'importDirect' | 'rebuild';
 type JobStatus = 'pending' | 'analyzing' | 'awaiting_execution' | 'running' | 'completed' | 'failed' | 'partial';
@@ -1361,6 +1366,7 @@ export class ChatwootHistoryService {
         (await chatwootImport.importHistoryMessages(instance, this.chatwootService, context.inbox, context.provider, {
           allowedPhoneNumbers: new Set([`+${phoneNumber}`]),
           forceFksByPhoneNumber: forceFksByPhoneNumber.size > 0 ? forceFksByPhoneNumber : undefined,
+          prismaRepository: this.prismaRepository,
         })) || 0;
 
       if (targetConversationId) {

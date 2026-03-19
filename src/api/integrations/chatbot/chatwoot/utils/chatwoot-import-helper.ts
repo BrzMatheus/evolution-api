@@ -2,12 +2,20 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import { ChatwootDto } from '@api/integrations/chatbot/chatwoot/dto/chatwoot.dto';
 import { postgresClient } from '@api/integrations/chatbot/chatwoot/libs/postgres.client';
 import { ChatwootService } from '@api/integrations/chatbot/chatwoot/services/chatwoot.service';
-import { Chatwoot, configService } from '@config/env.config';
+import { PrismaRepository } from '@api/repository/repository.service';
+import { Chatwoot, configService, S3 } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { inbox } from '@figuro/chatwoot-sdk';
 import { Chatwoot as ChatwootModel, Contact, Message } from '@prisma/client';
-import { getChatwootPhoneNumber, resolveCanonicalJid } from '@utils/whatsapp-jid';
+import {
+  getChatwootIdentifier,
+  getChatwootPhoneNumber,
+  resolveCanonicalJid,
+  resolveChatwootDisplayName,
+} from '@utils/whatsapp-jid';
+import axios from 'axios';
 import { proto } from 'baileys';
+import { Readable } from 'stream';
 
 type ChatwootUser = {
   user_type: string;
@@ -30,6 +38,7 @@ type IWebMessageInfo = Omit<proto.IWebMessageInfo, 'key'> & Partial<Pick<proto.I
 type ImportHistoryOptions = {
   allowedPhoneNumbers?: Set<string>;
   forceFksByPhoneNumber?: Map<string, FksChatwoot>;
+  prismaRepository?: PrismaRepository;
 };
 
 type NormalizedDirection = 'incoming' | 'outgoing';
@@ -152,7 +161,14 @@ class ChatwootImport {
         for (const contact of contactsChunk) {
           const isGroup = this.isIgnorePhoneNumber(contact.remoteJid);
 
-          const contactName = isGroup ? `${contact.pushName} (GROUP)` : contact.pushName;
+          const phoneDigits = isGroup ? null : contact.remoteJid.split('@')[0];
+          const contactName = isGroup
+            ? `${contact.pushName || contact.remoteJid} (GROUP)`
+            : resolveChatwootDisplayName({
+                pushName: contact.pushName,
+                phoneNumber: phoneDigits,
+                identifiers: [contact.remoteJid],
+              });
           bindInsert.push(contactName);
           const bindName = `$${bindInsert.length}`;
 
@@ -173,7 +189,13 @@ class ChatwootImport {
         }
         sqlInsert += ` ON CONFLICT (identifier, account_id)
                        DO UPDATE SET
-                        name = EXCLUDED.name,
+                        name = CASE
+                          WHEN contacts.name IS NULL OR contacts.name = ''
+                            OR contacts.name ~ '^\\+?[0-9]{7,15}$'
+                            OR contacts.name ~ '@(s\\.whatsapp\\.net|lid|g\\.us|broadcast)$'
+                          THEN EXCLUDED.name
+                          ELSE contacts.name
+                        END,
                         phone_number = EXCLUDED.phone_number,
                         updated_at = NOW()`;
 
@@ -286,7 +308,12 @@ class ChatwootImport {
         );
       });
 
-      const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesOrdered);
+      const identifierByPhoneNumber = new Map<string, string>();
+      const allMessagesMappedByPhoneNumber = this.createMessagesMapByPhoneNumber(
+        messagesOrdered,
+        undefined,
+        identifierByPhoneNumber,
+      );
       // Map structure: +552199999999 => { first message timestamp from number, last message timestamp from number}
       const phoneNumbersWithTimestamp = new Map<string, firstLastTimestamp>();
       allMessagesMappedByPhoneNumber.forEach((messages: Message[], phoneNumber: string) => {
@@ -313,7 +340,11 @@ class ChatwootImport {
       let messagesChunk: Message[] = this.sliceIntoChunks(messagesOrdered, batchSize);
       while (messagesChunk.length > 0) {
         // Map structure: +552199999999 => Message[]
-        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(messagesChunk, options?.allowedPhoneNumbers);
+        const messagesByPhoneNumber = this.createMessagesMapByPhoneNumber(
+          messagesChunk,
+          options?.allowedPhoneNumbers,
+          identifierByPhoneNumber,
+        );
 
         if (messagesByPhoneNumber.size > 0) {
           const forcedPhoneNumbers = new Set(Array.from(options?.forceFksByPhoneNumber?.keys() || []));
@@ -334,6 +365,7 @@ class ChatwootImport {
               inbox,
               autoPhoneNumbersWithTimestamp,
               autoMessagesByPhoneNumber,
+              identifierByPhoneNumber,
             );
 
             autoFksByNumber.forEach((value, key) => fksByNumber.set(key, value));
@@ -344,6 +376,13 @@ class ChatwootImport {
             (content, processed_message_content, account_id, inbox_id, conversation_id, message_type, private, content_type,
             sender_type, sender_id, source_id, created_at, updated_at) VALUES `;
           const bindInsertMsg = [provider.accountId, inbox.id];
+
+          // Collect quoted message references for post-insert UPDATE
+          const quotedMessageRefs: Array<{
+            sourceId: string;
+            stanzaSourceId: string;
+            conversationId: string;
+          }> = [];
 
           for (const [phoneNumber, rawMessages] of messagesByPhoneNumber.entries()) {
             const fksChatwoot = fksByNumber.get(phoneNumber);
@@ -359,6 +398,16 @@ class ChatwootImport {
               rawMessages,
             );
 
+            // Collect media messages for separate processing via Chatwoot API
+            const pendingMediaMessages: Array<{
+              message: Message;
+              conversationId: number;
+              sourceId: string;
+              messageType: 'incoming' | 'outgoing';
+              content: string;
+              timestamp: number;
+            }> = [];
+
             conversationMessages.forEach((message) => {
               const messageKey = (message.key || {}) as {
                 id?: string;
@@ -366,6 +415,33 @@ class ChatwootImport {
               };
 
               if (!message.message) {
+                return;
+              }
+
+              const mediaType = this.getMediaType(message as any);
+              const chatwootSourceId = this.toChatwootSourceId(messageKey.id);
+
+              // If message has media and prismaRepository is available, defer to API-based import
+              if (mediaType && options?.prismaRepository) {
+                const caption = this.getMediaCaption(message as any);
+                pendingMediaMessages.push({
+                  message,
+                  conversationId: Number(fksChatwoot.conversation_id),
+                  sourceId: chatwootSourceId,
+                  messageType: messageKey.fromMe ? 'outgoing' : 'incoming',
+                  content: caption,
+                  timestamp: message.messageTimestamp as number,
+                });
+
+                // Still track quoted messages for media messages
+                const stanzaId = this.extractStanzaId(message.message as Record<string, any>);
+                if (stanzaId && chatwootSourceId && messageKey.id) {
+                  quotedMessageRefs.push({
+                    sourceId: chatwootSourceId,
+                    stanzaSourceId: this.toChatwootSourceId(stanzaId),
+                    conversationId: fksChatwoot.conversation_id,
+                  });
+                }
                 return;
               }
 
@@ -389,7 +465,7 @@ class ChatwootImport {
               bindInsertMsg.push(messageKey.fromMe ? chatwootUser.user_id : fksChatwoot.contact_id);
               const bindSenderId = `$${bindInsertMsg.length}`;
 
-              bindInsertMsg.push(this.toChatwootSourceId(messageKey.id));
+              bindInsertMsg.push(chatwootSourceId);
               const bindSourceId = `$${bindInsertMsg.length}`;
 
               bindInsertMsg.push(message.messageTimestamp as number);
@@ -397,13 +473,60 @@ class ChatwootImport {
 
               sqlInsertMsg += `(${bindContent}, ${bindContent}, $1, $2, ${bindConversationId}, ${bindMessageType}, FALSE, 0,
                   ${bindSenderType},${bindSenderId},${bindSourceId}, to_timestamp(${bindmessageTimestamp}), to_timestamp(${bindmessageTimestamp})),`;
+
+              // Track quoted messages for linking after insert
+              const stanzaId = this.extractStanzaId(message.message as Record<string, any>);
+              if (stanzaId && chatwootSourceId && messageKey.id) {
+                quotedMessageRefs.push({
+                  sourceId: chatwootSourceId,
+                  stanzaSourceId: this.toChatwootSourceId(stanzaId),
+                  conversationId: fksChatwoot.conversation_id,
+                });
+              }
             });
+
+            // Import media messages via Chatwoot REST API (with S3 download)
+            if (pendingMediaMessages.length > 0 && options?.prismaRepository) {
+              const mediaImported = await this.importMediaMessages(
+                chatwootService,
+                options.prismaRepository,
+                pendingMediaMessages,
+              );
+              totalMessagesImported += mediaImported;
+
+              // For media messages that failed (no S3 record), fall back to text placeholder
+              // This is handled inside importMediaMessages - failed ones are just logged
+            }
           }
           if (bindInsertMsg.length > 2) {
             if (sqlInsertMsg.slice(-1) === ',') {
               sqlInsertMsg = sqlInsertMsg.slice(0, -1);
             }
             totalMessagesImported += (await pgClient.query(sqlInsertMsg, bindInsertMsg))?.rowCount ?? 0;
+
+            // Link quoted messages by setting content_attributes with in_reply_to_external_id
+            if (quotedMessageRefs.length > 0) {
+              const bindQuoted: any[] = [];
+              const valueParts: string[] = [];
+              for (const ref of quotedMessageRefs) {
+                bindQuoted.push(ref.sourceId);
+                const bindSrc = `$${bindQuoted.length}`;
+                bindQuoted.push(ref.stanzaSourceId);
+                const bindStanza = `$${bindQuoted.length}`;
+                bindQuoted.push(ref.conversationId);
+                const bindConv = `$${bindQuoted.length}`;
+                valueParts.push(`(${bindSrc}, ${bindStanza}, ${bindConv}::INTEGER)`);
+              }
+
+              await pgClient.query(
+                `UPDATE messages
+                  SET content_attributes = jsonb_build_object('in_reply_to_external_id', q.stanza_source_id)
+                  FROM (VALUES ${valueParts.join(',')}) AS q(source_id, stanza_source_id, conversation_id)
+                  WHERE messages.source_id = q.source_id
+                    AND messages.conversation_id = q.conversation_id`,
+                bindQuoted,
+              );
+            }
           }
         }
         messagesChunk = this.sliceIntoChunks(messagesOrdered, batchSize);
@@ -433,10 +556,11 @@ class ChatwootImport {
     inbox: inbox,
     phoneNumbersWithTimestamp: Map<string, firstLastTimestamp>,
     messagesByPhoneNumber: Map<string, Message[]>,
+    identifierByPhoneNumber?: Map<string, string>,
   ): Promise<Map<string, FksChatwoot>> {
     const pgClient = postgresClient.getChatwootConnection();
 
-    const bindValues = [provider.accountId, inbox.id];
+    const bindValues: any[] = [provider.accountId, inbox.id];
     const phoneNumberBind = Array.from(messagesByPhoneNumber.keys())
       .map((phoneNumber) => {
         const phoneNumberTimestamp = phoneNumbersWithTimestamp.get(phoneNumber);
@@ -449,6 +573,11 @@ class ChatwootImport {
           bindStr += `$${bindValues.length},`;
 
           bindValues.push(phoneNumberTimestamp.last);
+          bindStr += `$${bindValues.length},`;
+
+          // Use the canonical identifier when available, otherwise default to phone@s.whatsapp.net
+          const identifier = identifierByPhoneNumber?.get(phoneNumber) || null;
+          bindValues.push(identifier);
           return `${bindStr}$${bindValues.length})`;
         }
       })
@@ -457,30 +586,35 @@ class ChatwootImport {
     // select (or insert when necessary) data from tables contacts, contact_inboxes, conversations from chatwoot db
     const sqlFromChatwoot = `WITH
               phone_number AS (
-                SELECT phone_number, created_at::INTEGER, last_activity_at::INTEGER FROM (
-                  VALUES 
+                SELECT phone_number, created_at::INTEGER, last_activity_at::INTEGER, canonical_identifier FROM (
+                  VALUES
                    ${phoneNumberBind}
-                 ) as t (phone_number, created_at, last_activity_at)
+                 ) as t (phone_number, created_at, last_activity_at, canonical_identifier)
               ),
 
               only_new_phone_number AS (
                 SELECT * FROM phone_number
                 WHERE phone_number NOT IN (
-                  SELECT phone_number
-                  FROM contacts
-                    JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
-                    JOIN conversations con ON con.contact_inbox_id = ci.id 
-                      AND con.account_id = $1
-                      AND con.inbox_id = $2
-                      AND con.contact_id = contacts.id
+                  SELECT p2.phone_number
+                  FROM phone_number p2
+                  JOIN contacts ON (
+                    contacts.phone_number = p2.phone_number
+                    OR (p2.canonical_identifier IS NOT NULL AND contacts.identifier = p2.canonical_identifier)
+                  )
+                  JOIN contact_inboxes ci ON ci.contact_id = contacts.id AND ci.inbox_id = $2
+                  JOIN conversations con ON con.contact_inbox_id = ci.id
+                    AND con.account_id = $1
+                    AND con.inbox_id = $2
+                    AND con.contact_id = contacts.id
                   WHERE contacts.account_id = $1
                 )
               ),
 
               new_contact AS (
                 INSERT INTO contacts (name, phone_number, account_id, identifier, created_at, updated_at)
-                SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1, CONCAT(REPLACE(p.phone_number, '+', ''),
-                  '@s.whatsapp.net'), to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
+                SELECT REPLACE(p.phone_number, '+', ''), p.phone_number, $1,
+                  COALESCE(p.canonical_identifier, CONCAT(REPLACE(p.phone_number, '+', ''), '@s.whatsapp.net')),
+                  to_timestamp(p.created_at), to_timestamp(p.last_activity_at)
                 FROM only_new_phone_number AS p
                 ON CONFLICT(identifier, account_id) DO UPDATE SET updated_at = EXCLUDED.updated_at
                 RETURNING id, phone_number, created_at, updated_at
@@ -489,7 +623,7 @@ class ChatwootImport {
               new_contact_inbox AS (
                 INSERT INTO contact_inboxes (contact_id, inbox_id, source_id, created_at, updated_at)
                 SELECT new_contact.id, $2, gen_random_uuid(), new_contact.created_at, new_contact.updated_at
-                FROM new_contact 
+                FROM new_contact
                 RETURNING id, contact_id, created_at, updated_at
               ),
 
@@ -503,14 +637,17 @@ class ChatwootImport {
               )
 
               SELECT new_contact.phone_number, new_conversation.contact_id, new_conversation.id AS conversation_id
-              FROM new_conversation 
+              FROM new_conversation
               JOIN new_contact ON new_conversation.contact_id = new_contact.id
 
               UNION
 
               SELECT p.phone_number, c.id contact_id, con.id conversation_id
                 FROM phone_number p
-              JOIN contacts c ON c.phone_number = p.phone_number
+              JOIN contacts c ON (
+                c.phone_number = p.phone_number
+                OR (p.canonical_identifier IS NOT NULL AND c.identifier = p.canonical_identifier)
+              )
               JOIN contact_inboxes ci ON ci.contact_id = c.id AND ci.inbox_id = $2
               JOIN conversations con ON con.contact_inbox_id = ci.id AND con.account_id = $1
                 AND con.inbox_id = $2 AND con.contact_id = c.id`;
@@ -537,6 +674,7 @@ class ChatwootImport {
   public createMessagesMapByPhoneNumber(
     messages: Message[],
     allowedPhoneNumbers?: Set<string>,
+    identifierByPhoneNumber?: Map<string, string>,
   ): Map<string, Message[]> {
     return messages.reduce((acc: Map<string, Message[]>, message: Message) => {
       const identity = this.getMessageIdentity(message);
@@ -553,6 +691,13 @@ class ChatwootImport {
         const groupedMessages = acc.has(phoneNumberPlus) ? acc.get(phoneNumberPlus) : [];
         groupedMessages.push(message);
         acc.set(phoneNumberPlus, groupedMessages);
+
+        if (identifierByPhoneNumber && !identifierByPhoneNumber.has(phoneNumberPlus)) {
+          const identifier = getChatwootIdentifier(identity) || identity.canonicalJid || identity.remoteJid;
+          if (identifier) {
+            identifierByPhoneNumber.set(phoneNumberPlus, identifier);
+          }
+        }
       }
 
       return acc;
@@ -579,6 +724,127 @@ class ChatwootImport {
     } catch (error) {
       this.logger.error(`Error on get recent conversations: ${error.toString()}`);
     }
+  }
+
+  private static readonly MEDIA_TYPE_MAP: Record<string, string> = {
+    imageMessage: 'image',
+    videoMessage: 'video',
+    audioMessage: 'audio',
+    documentMessage: 'file',
+    documentWithCaptionMessage: 'file',
+    stickerMessage: 'image',
+  };
+
+  public getMediaType(msg: IWebMessageInfo): string | null {
+    const normalizedMessage = this.unwrapMessagePayload(msg.message as Record<string, any> | undefined);
+    for (const key of Object.keys(ChatwootImport.MEDIA_TYPE_MAP)) {
+      if (key === 'documentWithCaptionMessage') {
+        if (normalizedMessage.documentWithCaptionMessage?.message?.documentMessage) {
+          return ChatwootImport.MEDIA_TYPE_MAP[key];
+        }
+      } else if (normalizedMessage[key] !== undefined && normalizedMessage[key] !== null) {
+        return ChatwootImport.MEDIA_TYPE_MAP[key];
+      }
+    }
+    return null;
+  }
+
+  public getMediaCaption(msg: IWebMessageInfo): string {
+    const normalizedMessage = this.unwrapMessagePayload(msg.message as Record<string, any> | undefined);
+    if (normalizedMessage.imageMessage?.caption) return normalizedMessage.imageMessage.caption;
+    if (normalizedMessage.videoMessage?.caption) return normalizedMessage.videoMessage.caption;
+    if (normalizedMessage.audioMessage?.caption) return normalizedMessage.audioMessage.caption;
+    if (normalizedMessage.documentMessage) {
+      const doc = normalizedMessage.documentMessage;
+      return [doc.fileName, doc.caption].filter(Boolean).join(' ');
+    }
+    if (normalizedMessage.documentWithCaptionMessage?.message?.documentMessage) {
+      const doc = normalizedMessage.documentWithCaptionMessage.message.documentMessage;
+      return [doc.fileName, doc.caption].filter(Boolean).join(' ');
+    }
+    return '';
+  }
+
+  public async importMediaMessages(
+    chatwootService: ChatwootService,
+    prismaRepository: PrismaRepository,
+    mediaMessages: Array<{
+      message: Message;
+      conversationId: number;
+      sourceId: string;
+      messageType: 'incoming' | 'outgoing';
+      content: string;
+      timestamp: number;
+    }>,
+  ): Promise<number> {
+    if (mediaMessages.length === 0) return 0;
+
+    const s3Enabled = configService.get<S3>('S3')?.ENABLE;
+    if (!s3Enabled) {
+      this.logger.warn('S3 is not enabled, skipping media import');
+      return 0;
+    }
+
+    // Batch-load Media records for all message IDs
+    const messageIds = mediaMessages.map((m) => m.message.id);
+    const mediaRecords = await prismaRepository.media.findMany({
+      where: { messageId: { in: messageIds } },
+    });
+    const mediaByMessageId = new Map(
+      mediaRecords.map((m: any) => [
+        m.messageId,
+        m as { messageId: string; fileName: string; type: string; mimetype: string },
+      ]),
+    );
+
+    let imported = 0;
+    const concurrency = 5;
+
+    for (let i = 0; i < mediaMessages.length; i += concurrency) {
+      const batch = mediaMessages.slice(i, i + concurrency);
+      const results = await Promise.allSettled(
+        batch.map(async (item) => {
+          const media = mediaByMessageId.get(item.message.id) as
+            | { messageId: string; fileName: string; type: string; mimetype: string }
+            | undefined;
+          if (!media?.fileName) {
+            return null;
+          }
+
+          try {
+            const { getObjectUrl } = await import('@api/integrations/storage/s3/libs/minio.server');
+            const mediaUrl = await getObjectUrl(media.fileName);
+            if (!mediaUrl) return null;
+
+            // Download file from S3 into a buffer and create a Readable stream
+            const response = await axios.get(mediaUrl, { responseType: 'arraybuffer' });
+            const buffer = Buffer.from(response.data);
+            const fileStream = Readable.from(buffer);
+
+            const fileName = media.fileName.split('/').pop() || `media_${Date.now()}`;
+
+            await chatwootService.sendHistoryMediaMessage({
+              conversationId: item.conversationId,
+              fileStream,
+              fileName,
+              messageType: item.messageType,
+              content: item.content || undefined,
+              sourceId: item.sourceId,
+              timestamp: item.timestamp,
+            });
+
+            return true;
+          } catch (error) {
+            this.logger.error(`Error importing media for message ${item.message.id}: ${error}`);
+            return null;
+          }
+        }),
+      );
+
+      imported += results.filter((r) => r.status === 'fulfilled' && r.value === true).length;
+    }
+
+    return imported;
   }
 
   public getContentMessage(chatwootService: ChatwootService, msg: IWebMessageInfo) {
@@ -918,6 +1184,17 @@ class ChatwootImport {
     return current || {};
   }
 
+  private extractStanzaId(message: Record<string, any> | undefined): string | null {
+    if (!message) return null;
+    const unwrapped = this.unwrapMessagePayload(message);
+    // stanzaId can be in contextInfo of any message type
+    for (const key of Object.keys(unwrapped || {})) {
+      const stanzaId = unwrapped[key]?.contextInfo?.stanzaId;
+      if (stanzaId) return stanzaId;
+    }
+    return unwrapped?.contextInfo?.stanzaId || null;
+  }
+
   private humanizeMessageType(typeKey: string) {
     return typeKey
       .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
@@ -939,8 +1216,15 @@ class ChatwootImport {
   }
 
   private getMessagePhoneNumber(message: Message) {
-    const phoneNumber = getChatwootPhoneNumber(this.getMessageIdentity(message));
-    return phoneNumber ? String(phoneNumber).replace(/^\+/, '').split('@')[0] : null;
+    const identity = this.getMessageIdentity(message);
+    const phoneNumber = getChatwootPhoneNumber(identity);
+    if (!phoneNumber) {
+      this.logger.warn(
+        `Unable to resolve phone number for message (canonicalJid=${identity.canonicalJid}, remoteJid=${identity.remoteJid}). Message will be skipped.`,
+      );
+      return null;
+    }
+    return String(phoneNumber).replace(/^\+/, '').split('@')[0];
   }
 
   private getMessageConversationKey(message: Message) {
