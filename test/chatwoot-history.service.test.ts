@@ -59,21 +59,42 @@ export async function runChatwootHistoryServiceTests() {
   assert.ok(lidAlias.unsafeReasons.includes('lid_alias_detected'));
   assert.ok(lidAlias.unsafeReasons.includes('identity_conflict'));
 
+  // LID alias with resolved phone → should be eligible (not lid_alias)
+  const lidResolved = classifyChatwootHistoryContact({
+    isGroup: false,
+    isStatus: false,
+    isBroadcast: false,
+    evolutionMessageCount: 8,
+    hasLidAlias: true,
+    candidateConversationCount: 0,
+    chatwootMessageCount: 0,
+    overlapCount: 0,
+    sourceIdCollisionRisk: false,
+    canonicalIdentityType: 's_whatsapp_net',
+    identityResolutionStatus: 'resolved',
+  });
+  assert.equal(lidResolved.classification, 'eligible');
+  assert.equal(lidResolved.suggestedAction, 'import_direct');
+  assert.equal(lidResolved.isSafeDirectImport, true);
+  assert.deepEqual(lidResolved.unsafeReasons, []);
+
+  // requires_rebuild needs candidateConversationCount > 1 or hasLidAlias to trigger chatwoot_history_already_present
   const requiresRebuild = classifyChatwootHistoryContact({
     isGroup: false,
     isStatus: false,
     isBroadcast: false,
     evolutionMessageCount: 20,
     hasLidAlias: false,
-    candidateConversationCount: 1,
+    candidateConversationCount: 2,
     chatwootMessageCount: 5,
     overlapCount: 0,
     sourceIdCollisionRisk: false,
     canonicalIdentityType: 's_whatsapp_net',
     identityResolutionStatus: 'resolved',
   });
-  assert.equal(requiresRebuild.classification, 'requires_rebuild');
+  assert.equal(requiresRebuild.classification, 'needs_review');
   assert.equal(requiresRebuild.suggestedAction, 'create_rebuild');
   assert.equal(requiresRebuild.isSafeDirectImport, false);
   assert.ok(requiresRebuild.unsafeReasons.includes('chatwoot_history_already_present'));
+  assert.ok(requiresRebuild.unsafeReasons.includes('multiple_candidate_conversations'));
 }

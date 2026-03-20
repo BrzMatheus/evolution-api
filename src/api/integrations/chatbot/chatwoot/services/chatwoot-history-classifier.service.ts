@@ -45,14 +45,12 @@ export function classifyChatwootHistoryContact(
 
   const isCompleteOverlap = args.overlapCount >= args.evolutionMessageCount && args.evolutionMessageCount > 0;
 
-  // Complete overlap with single candidate, resolved identity, no LID alias = safe no-op
-  if (
-    isCompleteOverlap &&
-    args.candidateConversationCount === 1 &&
-    !args.hasLidAlias &&
-    args.canonicalIdentityType === 's_whatsapp_net' &&
-    args.identityResolutionStatus === 'resolved'
-  ) {
+  const isIdentityResolved =
+    args.canonicalIdentityType === 's_whatsapp_net' && args.identityResolutionStatus === 'resolved';
+  const hasUnresolvedLid = args.hasLidAlias && !isIdentityResolved;
+
+  // Complete overlap with single candidate, resolved identity = safe no-op
+  if (isCompleteOverlap && args.candidateConversationCount === 1 && !hasUnresolvedLid && isIdentityResolved) {
     return {
       classification: 'eligible',
       suggestedAction: 'import_direct',
@@ -63,7 +61,7 @@ export function classifyChatwootHistoryContact(
 
   const unsafeReasons = new Set<UnsafeReason>();
 
-  if (args.hasLidAlias) {
+  if (hasUnresolvedLid) {
     unsafeReasons.add('lid_alias_detected');
   }
 
@@ -82,18 +80,19 @@ export function classifyChatwootHistoryContact(
   }
 
   // Only flag history as unsafe when combined with other risk factors
-  if (args.chatwootMessageCount > 0 && (args.candidateConversationCount > 1 || args.hasLidAlias)) {
+  if (args.chatwootMessageCount > 0 && (args.candidateConversationCount > 1 || hasUnresolvedLid)) {
     unsafeReasons.add('chatwoot_history_already_present');
   }
 
-  if (args.canonicalIdentityType !== 's_whatsapp_net' || args.identityResolutionStatus !== 'resolved') {
+  if (!isIdentityResolved) {
     unsafeReasons.add('identity_conflict');
   }
 
   const unsafeReasonList = Array.from(unsafeReasons);
   const isSafeDirectImport = unsafeReasonList.length === 0;
 
-  if (args.hasLidAlias) {
+  // LID alias with unresolved phone → force lid_alias classification (needs rebuild)
+  if (hasUnresolvedLid) {
     return {
       classification: 'lid_alias',
       suggestedAction: args.candidateConversationCount > 0 ? 'create_rebuild' : 'open_chatwoot',
@@ -111,7 +110,7 @@ export function classifyChatwootHistoryContact(
     return {
       classification: 'needs_review',
       suggestedAction:
-        args.candidateConversationCount === 1 && !args.hasLidAlias
+        args.candidateConversationCount === 1 && !hasUnresolvedLid
           ? 'import_direct'
           : args.candidateConversationCount > 0
             ? 'create_rebuild'
