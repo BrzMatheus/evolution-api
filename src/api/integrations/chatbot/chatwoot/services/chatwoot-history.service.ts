@@ -1192,7 +1192,7 @@ export class ChatwootHistoryService {
         lastActivityAt: candidateConversation.lastActivityAt,
         matchedCanonicalSourceIds: Array.from(inspection.matchedCanonicalSourceIds),
         matchedFallbackSignatures: Array.from(inspection.matchedFallbackSignatures),
-        reviewUrl: this.buildConversationUrl(context.provider, candidateConversation.displayId),
+        reviewUrl: this.buildConversationUrl(context.provider, candidateConversation.displayId, context.inboxId),
       });
     }
 
@@ -1836,7 +1836,7 @@ export class ChatwootHistoryService {
     let reviewUrl = fallbackUrl;
 
     if (chatwootConversationId) {
-      reviewUrl = this.buildConversationUrl(provider, chatwootConversationId);
+      reviewUrl = this.buildConversationUrl(provider, chatwootConversationId, inboxId);
     } else if (chatwootContactId) {
       reviewUrl = this.buildContactUrl(provider, chatwootContactId);
     }
@@ -2107,8 +2107,12 @@ export class ChatwootHistoryService {
     return !channelType || channelType.includes('api');
   }
 
-  private buildConversationUrl(provider: ChatwootModel, conversationId: number) {
-    return `${this.normalizeBaseUrl(provider.url)}/app/accounts/${provider.accountId}/conversations/${conversationId}`;
+  private buildConversationUrl(provider: ChatwootModel, conversationId: number, inboxId?: number | null) {
+    const base = `${this.normalizeBaseUrl(provider.url)}/app/accounts/${provider.accountId}`;
+    if (inboxId) {
+      return `${base}/inbox/${inboxId}/conversations/${conversationId}`;
+    }
+    return `${base}/conversations/${conversationId}`;
   }
 
   private buildContactUrl(provider: ChatwootModel, contactId: number) {
@@ -2120,14 +2124,16 @@ export class ChatwootHistoryService {
   }
 
   private buildConversationUrlFromReview(reviewPayload: ChatwootReviewPayload, conversationId: number) {
+    const inboxSegment = reviewPayload.chatwootInboxId ? `/inbox/${reviewPayload.chatwootInboxId}` : '';
+
     if (reviewPayload.chatwootReviewUrl && reviewPayload.chatwootReviewUrl.includes('/app/accounts/')) {
       const base = reviewPayload.chatwootReviewUrl.split('/app/accounts/')[0];
-      return `${base}/app/accounts/${reviewPayload.chatwootAccountId}/conversations/${conversationId}`;
+      return `${base}/app/accounts/${reviewPayload.chatwootAccountId}${inboxSegment}/conversations/${conversationId}`;
     }
 
     if (reviewPayload.chatwootFallbackUrl && reviewPayload.chatwootFallbackUrl.includes('/app/accounts/')) {
       const base = reviewPayload.chatwootFallbackUrl.split('/app/accounts/')[0];
-      return `${base}/app/accounts/${reviewPayload.chatwootAccountId}/conversations/${conversationId}`;
+      return `${base}/app/accounts/${reviewPayload.chatwootAccountId}${inboxSegment}/conversations/${conversationId}`;
     }
 
     return reviewPayload.chatwootReviewUrl;
