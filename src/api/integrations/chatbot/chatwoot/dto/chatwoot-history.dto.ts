@@ -17,7 +17,7 @@ export class ChatwootHistoryExecuteDto {
 export class ChatwootHistoryContactActionDto {
   jobId: string;
   remoteJid: string;
-  action: 'importDirect' | 'createRebuild' | 'ignore' | 'openChatwootReview';
+  action: 'importDirect' | 'createRebuild' | 'ignore' | 'openChatwootReview' | 'resolveLid';
   canonicalConversationId?: number;
 }
 

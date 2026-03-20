@@ -19,6 +19,7 @@ import {
 } from '@api/integrations/chatbot/chatwoot/services/chatwoot-history-classifier.service';
 import { chatwootImport, FksChatwoot } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
 import { PrismaRepository } from '@api/repository/repository.service';
+import { WAMonitoringService } from '@api/services/monitor.service';
 import { Logger } from '@config/logger.config';
 import { BadRequestException, NotFoundException } from '@exceptions';
 import { Chatwoot as ChatwootModel, Message as MessageModel, Prisma } from '@prisma/client';
@@ -188,6 +189,7 @@ export class ChatwootHistoryService {
   constructor(
     private readonly prismaRepository: PrismaRepository,
     private readonly chatwootService: ChatwootService,
+    private readonly waMonitor?: WAMonitoringService,
   ) {}
 
   public async getInboxStatus(instance: InstanceDto) {
@@ -503,6 +505,10 @@ export class ChatwootHistoryService {
         url: reviewPayload.chatwootReviewUrl || reviewPayload.chatwootFallbackUrl,
         ...reviewPayload,
       };
+    }
+
+    if (data.action === 'resolveLid') {
+      return this.handleResolveLid(scopedInstance, job.id, contact);
     }
 
     if (data.action === 'ignore') {
@@ -1012,6 +1018,59 @@ export class ChatwootHistoryService {
       this.resolvePhoneFromMessages(messages) || (await this.resolvePhoneFromIsOnWhatsapp(resolved.lidJid));
     if (!inferred) return resolved;
     return resolveCanonicalJid({ remoteJid, phoneJid: inferred, lidJid: resolved.lidJid });
+  }
+
+  private async resolveLidViaSignalStore(instance: InstanceDto, lidJid: string): Promise<string | null> {
+    if (!this.waMonitor || !lidJid) return null;
+    try {
+      const waInstance = this.waMonitor.waInstances?.[instance.instanceName];
+      if (!waInstance?.client?.signalRepository?.lidMapping) return null;
+      const phoneJid = await waInstance.client.signalRepository.lidMapping.getPNForLID(lidJid);
+      return phoneJid && typeof phoneJid === 'string' && phoneJid.endsWith('@s.whatsapp.net') ? phoneJid : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async handleResolveLid(instance: InstanceDto, jobId: string, contact: any) {
+    const lidJid = contact.lidJid || contact.remoteJid;
+    if (!lidJid || !lidJid.endsWith('@lid')) {
+      throw new BadRequestException('Contact does not have a LID to resolve');
+    }
+
+    // Try signal store first, then messages, then IsOnWhatsapp
+    let phoneJid = await this.resolveLidViaSignalStore(instance, lidJid);
+
+    if (!phoneJid) {
+      const resolved = resolveCanonicalJid({ remoteJid: contact.remoteJid, lidJid });
+      const messages = await this.loadEvolutionMessages(instance, contact.remoteJid, resolved);
+      phoneJid = this.resolvePhoneFromMessages(messages);
+    }
+
+    if (!phoneJid) {
+      phoneJid = await this.resolvePhoneFromIsOnWhatsapp(lidJid);
+    }
+
+    if (!phoneJid) {
+      throw new BadRequestException(
+        'Could not resolve phone number for this LID. The WhatsApp session may not have the mapping available.',
+      );
+    }
+
+    const resolved = resolveCanonicalJid({ remoteJid: contact.remoteJid, phoneJid, lidJid });
+    const identity = this.resolveIdentityMetadata(resolved);
+
+    await this.prismaRepository.chatwootHistoryJobContact.update({
+      where: { id: contact.id },
+      data: {
+        phoneJid: resolved.phoneJid,
+        canonicalJid: resolved.canonicalJid,
+        canonicalIdentityType: identity.canonicalIdentityType,
+        identityResolutionStatus: identity.identityResolutionStatus,
+      },
+    });
+
+    return this.getJob(instance, jobId);
   }
 
   private hydrateEvolutionMessagesForImport(

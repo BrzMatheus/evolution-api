@@ -57,7 +57,7 @@ export const chatwootHistoryContactActionSchema: JSONSchema7 = {
     remoteJid: { type: 'string', minLength: 1 },
     action: {
       type: 'string',
-      enum: ['importDirect', 'createRebuild', 'ignore', 'openChatwootReview'],
+      enum: ['importDirect', 'createRebuild', 'ignore', 'openChatwootReview', 'resolveLid'],
     },
     canonicalConversationId: { type: 'number' },
   },

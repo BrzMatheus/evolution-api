@@ -84,7 +84,7 @@ const proxyService = new ProxyService(waMonitor);
 export const proxyController = new ProxyController(proxyService, waMonitor);
 
 const chatwootService = new ChatwootService(waMonitor, configService, prismaRepository, chatwootCache);
-const chatwootHistoryService = new ChatwootHistoryService(prismaRepository, chatwootService);
+const chatwootHistoryService = new ChatwootHistoryService(prismaRepository, chatwootService, waMonitor);
 export const chatwootController = new ChatwootController(chatwootService, configService);
 export const chatwootHistoryController = new ChatwootHistoryController(chatwootHistoryService);
 
