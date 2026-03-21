@@ -3,6 +3,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchBulkHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -24,6 +25,7 @@ import {
   blockUserSchema,
   contactValidateSchema,
   deleteMessageSchema,
+  fetchBulkHistorySchema,
   markChatUnreadSchema,
   messageUpSchema,
   messageValidateSchema,
@@ -268,6 +270,36 @@ export class ChatRouter extends RouterBroker {
           schema: null,
           ClassRef: InstanceDto,
           execute: (instance) => chatController.fetchPrivacySettings(instance),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('fetchBulkHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<FetchBulkHistoryDto>({
+          request: req,
+          schema: fetchBulkHistorySchema,
+          ClassRef: FetchBulkHistoryDto,
+          execute: (instance, data) => chatController.fetchBulkHistory(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      .get(this.routerPath('fetchBulkHistoryStatus'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<InstanceDto>({
+          request: req,
+          schema: null,
+          ClassRef: InstanceDto,
+          execute: (instance) => chatController.fetchBulkHistoryStatus(instance),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('cancelBulkHistory'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<InstanceDto>({
+          request: req,
+          schema: null,
+          ClassRef: InstanceDto,
+          execute: (instance) => chatController.cancelBulkHistory(instance),
         });
 
         return res.status(HttpStatus.OK).json(response);

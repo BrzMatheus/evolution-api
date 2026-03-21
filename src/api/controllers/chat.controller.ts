@@ -2,6 +2,7 @@ import {
   ArchiveChatDto,
   BlockUserDto,
   DeleteMessage,
+  FetchBulkHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
   NumberDto,
@@ -112,5 +113,32 @@ export class ChatController {
 
   public async blockUser({ instanceName }: InstanceDto, data: BlockUserDto) {
     return await this.waMonitor.waInstances[instanceName].blockUser(data);
+  }
+
+  public async fetchBulkHistory({ instanceName }: InstanceDto, data: FetchBulkHistoryDto) {
+    const instance = this.waMonitor.waInstances[instanceName] as any;
+    if (typeof instance.fetchBulkHistory !== 'function') {
+      throw new Error('fetchBulkHistory is only available for Baileys instances');
+    }
+    // Fire and forget - runs in background
+    instance.fetchBulkHistory(data).catch(() => {});
+    return { status: 'started' };
+  }
+
+  public async fetchBulkHistoryStatus({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName] as any;
+    if (typeof instance.getBulkHistoryStatus !== 'function') {
+      throw new Error('fetchBulkHistoryStatus is only available for Baileys instances');
+    }
+    return await instance.getBulkHistoryStatus();
+  }
+
+  public async cancelBulkHistory({ instanceName }: InstanceDto) {
+    const instance = this.waMonitor.waInstances[instanceName] as any;
+    if (typeof instance.cancelBulkHistory !== 'function') {
+      throw new Error('cancelBulkHistory is only available for Baileys instances');
+    }
+    instance.cancelBulkHistory();
+    return { status: 'cancelled' };
   }
 }

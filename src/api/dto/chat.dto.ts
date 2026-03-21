@@ -127,3 +127,9 @@ export class BlockUserDto {
   number: string;
   status: 'block' | 'unblock';
 }
+
+export class FetchBulkHistoryDto {
+  batchSize?: number;
+  autoResume?: boolean;
+  resetProgress?: boolean;
+}

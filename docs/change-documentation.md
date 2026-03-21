@@ -118,3 +118,24 @@ Do not wait for a separate documentation request. Documentation is part of deliv
 - `src/api/integrations/chatbot/chatwoot/services/chatwoot-history.service.ts` — `resolvePushName`, `resolveContactId`
 - `test/whatsapp-jid.test.ts` — unit tests for both new functions
 - `test/chatwoot.service.test.ts` — integration-style tests for display name in contact payloads
+
+---
+
+## Change
+- New chat-related HTTP surface: controller, router, DTO, and JSONSchema validation wired for chat operations.
+- Baileys channel service extended with handlers supporting the new chat flow.
+- Bundled Evolution Manager static build under `manager/dist/` updated (new hashed JS/CSS assets and `index.html` references).
+- Git submodule `evolution-manager-v2` bumped to commit that extends Chatwoot instance UI and `manageChatwoot` queries (pushed to `BrzMatheus/evolution-manager-v2` `main`).
+
+## Reason
+- Ship chat capabilities and aligned manager UI in one API release; keep embedded manager assets consistent with the submodule UI changes.
+
+## Impact
+- New or changed chat endpoints and Baileys behavior — clients and operators should verify integration against their instance configuration.
+- Consumers cloning the API repo should run `git submodule update --init --recursive` (or equivalent) after pull to match the recorded submodule SHA.
+- **Note**: `evolution-api` push to `origin` may still require HTTPS/PAT or a deploy key with **write** if SSH deploy key is read-only.
+
+## References
+- `src/api/controllers/chat.controller.ts`, `src/api/routes/chat.router.ts`, `src/api/dto/chat.dto.ts`, `src/validate/chat.schema.ts`
+- `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`
+- `manager/dist/`, `evolution-manager-v2` (submodule)

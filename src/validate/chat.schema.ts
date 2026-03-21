@@ -185,6 +185,16 @@ export const blockUserSchema: JSONSchema7 = {
   ...isNotEmpty('number', 'status'),
 };
 
+export const fetchBulkHistorySchema: JSONSchema7 = {
+  $id: v4(),
+  type: 'object',
+  properties: {
+    batchSize: { type: 'number', minimum: 1, maximum: 1000 },
+    autoResume: { type: 'boolean' },
+    resetProgress: { type: 'boolean' },
+  },
+};
+
 export const contactValidateSchema: JSONSchema7 = {
   $id: v4(),
   type: 'object',

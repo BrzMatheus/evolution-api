@@ -2601,6 +2601,246 @@ export class BaileysStartupService extends ChannelStartupService {
     );
   }
 
+  private bulkHistoryStatus: {
+    totalChats: number;
+    completedTotal: number;
+    completedBatch: number;
+    batchSize: number;
+    errors: number;
+    running: boolean;
+    autoResume: boolean;
+    nextBatchAt: string | null;
+    cancelled: boolean;
+    skippedAlreadyFetched: number;
+  } = {
+    totalChats: 0,
+    completedTotal: 0,
+    completedBatch: 0,
+    batchSize: 500,
+    errors: 0,
+    running: false,
+    autoResume: false,
+    nextBatchAt: null,
+    cancelled: false,
+    skippedAlreadyFetched: 0,
+  };
+
+  private bulkHistoryTimer: ReturnType<typeof setTimeout> | null = null;
+
+  private async markChatHistoryFetched(remoteJid: string, oldestTimestamp: number) {
+    const existing = await this.prismaRepository.chat.findFirst({
+      where: { instanceId: this.instanceId, remoteJid },
+    });
+    const labels = (existing?.labels as Record<string, any>) || {};
+    labels.bulkHistoryFetchedAt = new Date().toISOString();
+    labels.oldestFetchedTimestamp = oldestTimestamp;
+
+    if (existing) {
+      await this.prismaRepository.chat.update({
+        where: { id: existing.id },
+        data: { labels },
+      });
+    } else {
+      await this.prismaRepository.chat.create({
+        data: { instanceId: this.instanceId, remoteJid, labels },
+      });
+    }
+  }
+
+  private async isChatHistoryFetched(remoteJid: string): Promise<boolean> {
+    const chat = await this.prismaRepository.chat.findFirst({
+      where: { instanceId: this.instanceId, remoteJid },
+      select: { labels: true },
+    });
+    const labels = chat?.labels as Record<string, any>;
+    return Boolean(labels?.bulkHistoryFetchedAt);
+  }
+
+  private async getChatsFetchedCount(): Promise<number> {
+    const result: Array<{ count: bigint }> = await this.prismaRepository.$queryRaw`
+      SELECT COUNT(*)::int as count FROM "Chat"
+      WHERE "instanceId" = ${this.instanceId}
+        AND "labels"->>'bulkHistoryFetchedAt' IS NOT NULL
+    `;
+    return Number(result[0]?.count || 0);
+  }
+
+  public async getBulkHistoryStatus() {
+    const fetchedCount = await this.getChatsFetchedCount().catch(() => 0);
+    return {
+      totalChats: this.bulkHistoryStatus.totalChats,
+      completedTotal: this.bulkHistoryStatus.completedTotal,
+      completedBatch: this.bulkHistoryStatus.completedBatch,
+      batchSize: this.bulkHistoryStatus.batchSize,
+      errors: this.bulkHistoryStatus.errors,
+      running: this.bulkHistoryStatus.running,
+      processedChats: fetchedCount,
+      remainingChats: Math.max(0, this.bulkHistoryStatus.totalChats - fetchedCount),
+      autoResume: this.bulkHistoryStatus.autoResume,
+      nextBatchAt: this.bulkHistoryStatus.nextBatchAt,
+      skippedAlreadyFetched: this.bulkHistoryStatus.skippedAlreadyFetched,
+    };
+  }
+
+  public cancelBulkHistory() {
+    this.bulkHistoryStatus.cancelled = true;
+    this.bulkHistoryStatus.autoResume = false;
+    this.bulkHistoryStatus.nextBatchAt = null;
+    if (this.bulkHistoryTimer) {
+      clearTimeout(this.bulkHistoryTimer);
+      this.bulkHistoryTimer = null;
+    }
+    this.logger.info('Bulk history fetch cancelled');
+  }
+
+  public async resetBulkHistoryProgress() {
+    await this.prismaRepository.$executeRaw`
+      UPDATE "Chat"
+      SET "labels" = "labels" - 'bulkHistoryFetchedAt' - 'oldestFetchedTimestamp'
+      WHERE "instanceId" = ${this.instanceId}
+        AND "labels"->>'bulkHistoryFetchedAt' IS NOT NULL
+    `;
+    this.bulkHistoryStatus.completedTotal = 0;
+    this.bulkHistoryStatus.errors = 0;
+    this.logger.info('Bulk history progress reset');
+  }
+
+  public async fetchBulkHistory(options?: {
+    batchSize?: number;
+    autoResume?: boolean;
+    resetProgress?: boolean;
+  }): Promise<{ requested: number; errors: number }> {
+    if (this.bulkHistoryStatus.running) {
+      throw new Error('Bulk history fetch is already running');
+    }
+
+    if (!this.client) {
+      throw new Error('WhatsApp client is not connected');
+    }
+
+    const batchSize = options?.batchSize ?? 500;
+    const autoResume = options?.autoResume ?? false;
+
+    if (options?.resetProgress) {
+      await this.resetBulkHistoryProgress();
+    }
+
+    // Get all distinct chats that have messages
+    const distinctChats: Array<{ remoteJid: string }> = await this.prismaRepository.$queryRaw`
+      SELECT DISTINCT "key"->>'remoteJid' as "remoteJid"
+      FROM "Message"
+      WHERE "instanceId" = ${this.instanceId}
+        AND "key"->>'remoteJid' IS NOT NULL
+    `;
+
+    // Filter out chats already fetched (persisted in DB)
+    const pendingChats: Array<{ remoteJid: string }> = [];
+    let skipped = 0;
+    for (const chat of distinctChats) {
+      if (await this.isChatHistoryFetched(chat.remoteJid)) {
+        skipped++;
+      } else {
+        pendingChats.push(chat);
+      }
+    }
+
+    const batchChats = pendingChats.slice(0, batchSize);
+
+    this.bulkHistoryStatus.totalChats = distinctChats.length;
+    this.bulkHistoryStatus.batchSize = batchSize;
+    this.bulkHistoryStatus.completedBatch = 0;
+    this.bulkHistoryStatus.running = true;
+    this.bulkHistoryStatus.autoResume = autoResume;
+    this.bulkHistoryStatus.nextBatchAt = null;
+    this.bulkHistoryStatus.cancelled = false;
+    this.bulkHistoryStatus.skippedAlreadyFetched = skipped;
+
+    this.logger.info(
+      `Bulk history fetch starting: ${batchChats.length} chats in this batch, ${pendingChats.length} pending, ${skipped} already fetched (skipped)`,
+    );
+
+    if (batchChats.length === 0) {
+      this.bulkHistoryStatus.running = false;
+      this.bulkHistoryStatus.autoResume = false;
+      this.logger.info('Bulk history fetch: all chats already processed');
+      return { requested: 0, errors: 0 };
+    }
+
+    const randomDelay = () => {
+      const min = 10000;
+      const max = 20000;
+      return new Promise((resolve) => setTimeout(resolve, Math.floor(Math.random() * (max - min + 1)) + min));
+    };
+
+    let batchErrors = 0;
+
+    for (const chat of batchChats) {
+      if (this.bulkHistoryStatus.cancelled) {
+        this.logger.info('Bulk history fetch cancelled by user');
+        break;
+      }
+
+      try {
+        const oldestMsgs: Array<{ key: any; messageTimestamp: number }> = await this.prismaRepository.$queryRaw`
+          SELECT "key", "messageTimestamp"
+          FROM "Message"
+          WHERE "instanceId" = ${this.instanceId}
+            AND "key"->>'remoteJid' = ${chat.remoteJid}
+          ORDER BY "messageTimestamp" ASC
+          LIMIT 1
+        `;
+        const oldestMsg = oldestMsgs[0];
+
+        if (oldestMsg?.key && oldestMsg.messageTimestamp) {
+          const key = oldestMsg.key as proto.IMessageKey;
+          await this.client.fetchMessageHistory(999, key, oldestMsg.messageTimestamp);
+          await this.markChatHistoryFetched(chat.remoteJid, oldestMsg.messageTimestamp);
+        }
+
+        this.bulkHistoryStatus.completedBatch++;
+        this.bulkHistoryStatus.completedTotal++;
+      } catch (error) {
+        this.logger.error(`fetchBulkHistory error for ${chat.remoteJid}: ${error?.message}`);
+        // Don't mark as fetched on error - will retry next time
+        this.bulkHistoryStatus.completedBatch++;
+        this.bulkHistoryStatus.completedTotal++;
+        this.bulkHistoryStatus.errors++;
+        batchErrors++;
+      }
+
+      await randomDelay();
+    }
+
+    this.bulkHistoryStatus.running = false;
+
+    const fetchedCount = await this.getChatsFetchedCount().catch(() => 0);
+    const remaining = distinctChats.length - fetchedCount;
+
+    if (autoResume && remaining > 0 && !this.bulkHistoryStatus.cancelled) {
+      const hoursUntilNext = 24;
+      const nextBatchDate = new Date(Date.now() + hoursUntilNext * 60 * 60 * 1000);
+      this.bulkHistoryStatus.nextBatchAt = nextBatchDate.toISOString();
+      this.logger.info(
+        `Bulk history: ${remaining} chats remaining. Next batch scheduled for ${nextBatchDate.toLocaleString()}`,
+      );
+
+      this.bulkHistoryTimer = setTimeout(
+        () => {
+          this.bulkHistoryTimer = null;
+          this.fetchBulkHistory({ batchSize, autoResume: true }).catch((err) => {
+            this.logger.error(`Auto-resume bulk history failed: ${err?.message}`);
+          });
+        },
+        hoursUntilNext * 60 * 60 * 1000,
+      );
+    } else if (remaining === 0) {
+      this.logger.info('Bulk history fetch completed for all chats');
+      this.bulkHistoryStatus.autoResume = false;
+    }
+
+    return { requested: batchChats.length, errors: batchErrors };
+  }
+
   public async profilePicture(number: string) {
     const jid = createJid(number);
 
