@@ -752,12 +752,10 @@ export class ChannelStartupService {
             ELSE COALESCE("Contact"."pushName", "Message"."pushName")
           END as "pushName",
           "Contact"."profilePicUrl",
-          "Contact"."phoneJid" as "phoneJid",
           COALESCE(
-            to_timestamp("Message"."messageTimestamp"::double precision), 
+            to_timestamp("Message"."messageTimestamp"::double precision),
             "Contact"."updatedAt"
           ) as "updatedAt",
-          "Chat"."name" as "pushName",
           "Chat"."createdAt" as "windowStart",
           "Chat"."createdAt" + INTERVAL '24 hours' as "windowExpires",
           "Chat"."unreadMessages" as "unreadMessages",
@@ -813,7 +811,7 @@ export class ChannelStartupService {
         return {
           id: contact.contactId || null,
           remoteJid: contact.remoteJid,
-          phoneJid: contact.phoneJid || null,
+          phoneJid: null,
           pushName: contact.pushName,
           profilePicUrl: contact.profilePicUrl,
           updatedAt: contact.updatedAt,

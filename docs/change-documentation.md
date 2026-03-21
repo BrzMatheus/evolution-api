@@ -139,3 +139,17 @@ Do not wait for a separate documentation request. Documentation is part of deliv
 - `src/api/controllers/chat.controller.ts`, `src/api/routes/chat.router.ts`, `src/api/dto/chat.dto.ts`, `src/validate/chat.schema.ts`
 - `src/api/integrations/channel/whatsapp/whatsapp.baileys.service.ts`
 - `manager/dist/`, `evolution-manager-v2` (submodule)
+
+---
+
+## Change
+- Contact listing SQL in `ChannelStartupService` no longer selects duplicate `pushName` columns (`Contact` vs `Chat.name`) and drops `phoneJid` from the SELECT; mapped `phoneJid` in the response object is set to `null` for this path.
+
+## Reason
+- Duplicate column aliases broke or confused PostgreSQL result mapping; `phoneJid` was removed from the query to align the shape with available fields.
+
+## Impact
+- Callers that relied on `phoneJid` from this specific contact list payload will receive `null` until a dedicated source is restored; `pushName` should now map reliably from `Contact` / message fallback only.
+
+## References
+- `src/api/services/channel.service.ts`
