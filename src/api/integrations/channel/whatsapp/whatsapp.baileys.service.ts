@@ -1480,7 +1480,32 @@ export class BaileysStartupService extends ChannelStartupService {
     }) => {
       try {
         if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
-          console.log('received on-demand history sync, messages=', messages);
+          console.log('received on-demand history sync, messages=', messages.length);
+
+          // Track LID→phone mappings from contacts during bulk fetch
+          if (this.bulkHistoryStatus.running && contacts?.length > 0) {
+            for (const contact of contacts) {
+              if (contact.id?.includes('@lid')) {
+                // Check if any message in this batch has phoneJid info for this LID
+                const relatedMsgs = messages.filter(
+                  (m) => m.key?.remoteJid === contact.id || m.key?.participant === contact.id,
+                );
+                for (const msg of relatedMsgs) {
+                  const msgKey = msg.key as ExtendedIMessageKey;
+                  if (msgKey?.phoneJid && msgKey.phoneJid !== contact.id) {
+                    const alreadyTracked = this.bulkHistoryStatus.lidMappingsFound.some((m) => m.lid === contact.id);
+                    if (!alreadyTracked) {
+                      this.bulkHistoryStatus.lidMappingsFound.push({
+                        lid: contact.id,
+                        phone: msgKey.phoneJid,
+                      });
+                      this.logger.info(`LID mapping found from history sync: ${contact.id} → ${msgKey.phoneJid}`);
+                    }
+                  }
+                }
+              }
+            }
+          }
         }
         console.log(
           `recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`,
@@ -2612,6 +2637,9 @@ export class BaileysStartupService extends ChannelStartupService {
     nextBatchAt: string | null;
     cancelled: boolean;
     skippedAlreadyFetched: number;
+    newMessagesPerChat: Record<string, number>;
+    totalNewMessages: number;
+    lidMappingsFound: Array<{ lid: string; phone: string }>;
   } = {
     totalChats: 0,
     completedTotal: 0,
@@ -2623,6 +2651,9 @@ export class BaileysStartupService extends ChannelStartupService {
     nextBatchAt: null,
     cancelled: false,
     skippedAlreadyFetched: 0,
+    newMessagesPerChat: {},
+    totalNewMessages: 0,
+    lidMappingsFound: [],
   };
 
   private bulkHistoryTimer: ReturnType<typeof setTimeout> | null = null;
@@ -2679,6 +2710,9 @@ export class BaileysStartupService extends ChannelStartupService {
       autoResume: this.bulkHistoryStatus.autoResume,
       nextBatchAt: this.bulkHistoryStatus.nextBatchAt,
       skippedAlreadyFetched: this.bulkHistoryStatus.skippedAlreadyFetched,
+      newMessagesPerChat: this.bulkHistoryStatus.newMessagesPerChat,
+      totalNewMessages: this.bulkHistoryStatus.totalNewMessages,
+      lidMappingsFound: this.bulkHistoryStatus.lidMappingsFound,
     };
   }
 
@@ -2754,6 +2788,9 @@ export class BaileysStartupService extends ChannelStartupService {
     this.bulkHistoryStatus.nextBatchAt = null;
     this.bulkHistoryStatus.cancelled = false;
     this.bulkHistoryStatus.skippedAlreadyFetched = skipped;
+    this.bulkHistoryStatus.newMessagesPerChat = {};
+    this.bulkHistoryStatus.totalNewMessages = 0;
+    this.bulkHistoryStatus.lidMappingsFound = [];
 
     this.logger.info(
       `Bulk history fetch starting: ${batchChats.length} chats in this batch, ${pendingChats.length} pending, ${skipped} already fetched (skipped)`,
@@ -2792,8 +2829,50 @@ export class BaileysStartupService extends ChannelStartupService {
         const oldestMsg = oldestMsgs[0];
 
         if (oldestMsg?.key && oldestMsg.messageTimestamp) {
+          // Count messages before fetch
+          const countBefore: Array<{ count: bigint }> = await this.prismaRepository.$queryRaw`
+            SELECT COUNT(*)::int as count FROM "Message"
+            WHERE "instanceId" = ${this.instanceId}
+              AND "key"->>'remoteJid' = ${chat.remoteJid}
+          `;
+          const msgsBefore = Number(countBefore[0]?.count || 0);
+
           const key = oldestMsg.key as proto.IMessageKey;
           await this.client.fetchMessageHistory(999, key, oldestMsg.messageTimestamp);
+
+          // Wait a moment for messages to be processed via messaging-history.set
+          await new Promise((resolve) => setTimeout(resolve, 3000));
+
+          // Count messages after fetch
+          const countAfter: Array<{ count: bigint }> = await this.prismaRepository.$queryRaw`
+            SELECT COUNT(*)::int as count FROM "Message"
+            WHERE "instanceId" = ${this.instanceId}
+              AND "key"->>'remoteJid' = ${chat.remoteJid}
+          `;
+          const msgsAfter = Number(countAfter[0]?.count || 0);
+          const newMsgs = msgsAfter - msgsBefore;
+
+          if (newMsgs > 0) {
+            this.bulkHistoryStatus.newMessagesPerChat[chat.remoteJid] = newMsgs;
+            this.bulkHistoryStatus.totalNewMessages += newMsgs;
+          }
+
+          // Check for LID→phone mappings: if this chat is a LID, try to resolve it
+          if (chat.remoteJid.includes('@lid')) {
+            try {
+              const phoneJid = await this.client.signalRepository.lidMapping.getPNForLID(chat.remoteJid);
+              if (phoneJid && phoneJid !== chat.remoteJid) {
+                this.bulkHistoryStatus.lidMappingsFound.push({
+                  lid: chat.remoteJid,
+                  phone: phoneJid,
+                });
+                this.logger.info(`LID mapping found: ${chat.remoteJid} → ${phoneJid}`);
+              }
+            } catch {
+              // LID mapping not available, that's fine
+            }
+          }
+
           await this.markChatHistoryFetched(chat.remoteJid, oldestMsg.messageTimestamp);
         }
 
