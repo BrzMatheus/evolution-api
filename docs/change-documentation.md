@@ -153,3 +153,17 @@ Do not wait for a separate documentation request. Documentation is part of deliv
 
 ## References
 - `src/api/services/channel.service.ts`
+
+---
+
+## Change
+- Bundled Evolution Manager static build under `manager/dist/` updated: new hashed JS/CSS assets and `index.html` references; previous hashed bundle files removed from the tree.
+
+## Reason
+- Keep the embedded manager UI aligned with the latest `evolution-manager-v2` build output served from the API repo.
+
+## Impact
+- Operators cloning or deploying from this repo get the updated manager bundle without running a separate manager build; pull includes binary asset churn in `manager/dist/`.
+
+## References
+- `manager/dist/index.html`, `manager/dist/assets/`
