@@ -82,3 +82,21 @@ export function detectPriority(message: any, isIntegration: boolean): MessagePri
 export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+const TRANSIENT_ERROR_CODES = new Set([
+  'EAI_AGAIN', // DNS temporary failure
+  'ECONNRESET', // connection reset
+  'ETIMEDOUT', // connection timeout
+  'ECONNREFUSED', // connection refused (service down)
+  'ENETUNREACH', // network unreachable
+  'EHOSTUNREACH', // host unreachable
+  'ENOTCONN', // not connected
+]);
+
+export function isTransientError(error: Error): boolean {
+  const code = (error as any).code as string | undefined;
+  if (code && TRANSIENT_ERROR_CODES.has(code)) return true;
+  const status = (error as any).response?.status ?? (error as any).status;
+  if (typeof status === 'number' && status >= 500) return true;
+  return false;
+}

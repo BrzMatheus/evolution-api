@@ -2290,29 +2290,31 @@ export class ChatwootService {
                 quoted: await this.getQuotedMessage(body, instance),
               };
 
-              const messageSent = await this.sendAttachment(
-                waInstance,
-                chatId,
-                attachment.data_url,
-                formatText,
-                options,
-              );
-              if (!messageSent && body.conversation?.id) {
-                this.onSendMessageError(instance, body.conversation?.id);
-              }
+              let messageSent: any;
+              try {
+                messageSent = await this.sendAttachment(waInstance, chatId, attachment.data_url, formatText, options);
+                if (!messageSent && body.conversation?.id) {
+                  this.onSendMessageError(instance, body.conversation?.id);
+                }
 
-              await this.updateChatwootMessageId(
-                {
-                  ...messageSent,
-                },
-                {
-                  messageId: body.id,
-                  inboxId: body.inbox?.id,
-                  conversationId: body.conversation?.id,
-                  contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
-                },
-                instance,
-              );
+                await this.updateChatwootMessageId(
+                  {
+                    ...messageSent,
+                  },
+                  {
+                    messageId: body.id,
+                    inboxId: body.inbox?.id,
+                    conversationId: body.conversation?.id,
+                    contactInboxSourceId: body.conversation?.contact_inbox?.source_id,
+                  },
+                  instance,
+                );
+              } catch (error) {
+                if (body.conversation?.id) {
+                  this.onSendMessageError(instance, body.conversation?.id, error);
+                }
+                throw error;
+              }
             }
           } else {
             const data: SendTextDto = {

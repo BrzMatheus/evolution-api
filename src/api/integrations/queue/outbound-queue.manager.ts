@@ -15,6 +15,7 @@ import {
   getMediaType,
   getTextContent,
   isTextMessage,
+  isTransientError,
   randomDelay,
   sleep,
 } from './outbound-queue.utils';
@@ -488,8 +489,8 @@ export class OutboundQueueManager {
       }
     }
 
-    // Execute actual send
-    const result = await this.sendFn(msg.sender, msg.message, msg.options, msg.isIntegration);
+    // Execute actual send (with retry for transient errors)
+    const result = await this.executeSendWithRetry(msg);
 
     // Resolve promise
     msg.resolve(result);
@@ -521,6 +522,31 @@ export class OutboundQueueManager {
       this.highSentSinceMedium++;
     } else if (msg.priority === 'medium') {
       this.highSentSinceMedium = 0;
+    }
+  }
+
+  private async executeSendWithRetry(msg: QueuedMessage): Promise<any> {
+    const MAX_ATTEMPTS = 3;
+    for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+      try {
+        return await this.sendFn(msg.sender, msg.message, msg.options, msg.isIntegration);
+      } catch (error) {
+        const err = error instanceof Error ? error : new Error(String(error));
+        if (attempt < MAX_ATTEMPTS && isTransientError(err)) {
+          const delayMs = 3000 * attempt; // 3s, 6s
+          this.logger.warn(
+            `[Queue/${this.instanceId}] Send failed for ${msg.id} (attempt ${attempt}/${MAX_ATTEMPTS}): ${err.message}. Retrying in ${delayMs / 1000}s...`,
+          );
+          await sleep(delayMs);
+        } else {
+          if (attempt > 1) {
+            this.logger.error(
+              `[Queue/${this.instanceId}] All ${MAX_ATTEMPTS} attempts failed for ${msg.id}: ${err.message}`,
+            );
+          }
+          throw err;
+        }
+      }
     }
   }
 
