@@ -12,6 +12,7 @@ import {
   contentHash,
   formatETA,
   generateId,
+  getMediaType,
   getTextContent,
   isTextMessage,
   randomDelay,
@@ -49,18 +50,23 @@ export class OutboundQueueManager {
     queueSize: 0,
     queueSizeByPriority: { high: 0, medium: 0, low: 0 },
     etaMs: 0,
+    etaFormatted: '0s',
     etaByPriority: { high: 0, medium: 0, low: 0 },
     congestionMode: 'normal',
     droppedCount: 0,
     droppedLast5min: 0,
     sentCount: 0,
     sentDelayAvgMs: 0,
+    sentDelayAvgByPriority: { high: 0, medium: 0, low: 0 },
     promotedCount: 0,
     consolidatedCount: 0,
+    mediaGroupedCount: 0,
     modeChanges: 0,
   };
 
   private totalSentDelay = 0;
+  private totalSentDelayByPriority: Record<string, number> = { high: 0, medium: 0, low: 0 };
+  private sentCountByPriority: Record<string, number> = { high: 0, medium: 0, low: 0 };
   private processedSinceLastLog = 0;
 
   private readonly instanceId: string;
@@ -159,7 +165,10 @@ export class OutboundQueueManager {
         return; // consolidated into existing message, promise will resolve when that one sends
       }
 
-      // 5. Insert into queue
+      // 5. Tag media group (before insert, so the queue already has the lead)
+      this.tryGroupMedia(msg);
+
+      // 6. Insert into queue
       this.insertMessage(msg);
 
       // 6. Store hash for dedup
@@ -318,6 +327,50 @@ export class OutboundQueueManager {
     return true;
   }
 
+  private tryGroupMedia(msg: QueuedMessage): void {
+    const cfg = this.config.consolidation.mediaGroup;
+    if (!cfg.enabled) return;
+
+    const mediaType = getMediaType(msg.message);
+    if (!mediaType) return;
+
+    const conversationQueue = this.queues.get(msg.conversationJid);
+    if (!conversationQueue || conversationQueue.length === 0) return;
+
+    // Encontrar líder: último media do mesmo tipo na mesma conversa dentro da janela
+    const lead = [...conversationQueue]
+      .reverse()
+      .find(
+        (m) =>
+          m.priority === msg.priority &&
+          getMediaType(m.message) === mediaType &&
+          !m.quoted &&
+          (m.consolidatedWith?.length || 0) < cfg.maxSize - 1 &&
+          Date.now() - m.enqueuedAt < cfg.windowMs,
+      );
+
+    if (!lead) return;
+
+    // Marcar líder se ainda não marcado
+    if (!lead.mediaGroupId) {
+      lead.mediaGroupId = lead.id;
+      lead.isMediaGroupLead = true;
+    }
+
+    // Marcar nova mensagem como membro do grupo
+    msg.mediaGroupId = lead.mediaGroupId;
+    msg.isMediaGroupLead = false;
+
+    // Usar consolidatedWith apenas como contador de membros (sem merge de conteúdo)
+    if (!lead.consolidatedWith) lead.consolidatedWith = [];
+    lead.consolidatedWith.push(msg.id);
+
+    this.metrics.mediaGroupedCount++;
+    this.logger.verbose(
+      `[Queue] Media group: added ${msg.id} to group ${lead.mediaGroupId} for ${msg.conversationJid} (${(lead.consolidatedWith?.length || 0) + 1} items)`,
+    );
+  }
+
   // ─── QUEUE MANAGEMENT ──────────────────────────────────────
 
   private insertMessage(msg: QueuedMessage): void {
@@ -376,6 +429,13 @@ export class OutboundQueueManager {
     while (this.workerRunning) {
       const msg = this.selectNext();
       if (!msg) {
+        if (this.getTotalPending() > 0) {
+          // Mensagens existem mas temporariamente inacessíveis (conversa locked ou pausadas).
+          // Atualizar modo de congestionamento pode resumir pausadas; o sleep aguarda o lock expirar.
+          this.updateCongestionMode();
+          await sleep(2000);
+          continue;
+        }
         this.workerRunning = false;
         break;
       }
@@ -409,15 +469,23 @@ export class OutboundQueueManager {
     // Check deadline - promote or fast-track
     this.checkDeadline(msg);
 
-    // Get delay for current mode + priority
-    const delayRange = this.config.delays[this.congestionMode][msg.priority];
-    const delayMs = this.draining ? Math.min(randomDelay(delayRange), 1000) : randomDelay(delayRange);
+    // Membros de grupo de mídia (não-líderes) usam delay pequeno sem typing
+    const isMediaGroupMember = msg.mediaGroupId && !msg.isMediaGroupLead;
 
-    // Typing presence
-    if (this.config.typing.enabled && delayMs > 0) {
-      await this.sendTyping(msg.sender, delayMs);
-    } else if (delayMs > 0) {
-      await sleep(delayMs);
+    if (isMediaGroupMember) {
+      const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
+      if (groupDelayMs > 0) await sleep(groupDelayMs);
+    } else {
+      // Get delay for current mode + priority
+      const delayRange = this.config.delays[this.congestionMode][msg.priority];
+      const delayMs = this.draining ? Math.min(randomDelay(delayRange), 1000) : randomDelay(delayRange);
+
+      // Typing presence
+      if (this.config.typing.enabled && delayMs > 0) {
+        await this.sendTyping(msg.sender, delayMs);
+      } else if (delayMs > 0) {
+        await sleep(delayMs);
+      }
     }
 
     // Execute actual send
@@ -427,14 +495,26 @@ export class OutboundQueueManager {
     msg.resolve(result);
     this.removeMessage(msg);
 
-    // Update conversation lock
-    this.conversationLocks.set(msg.conversationJid, Date.now());
+    // Update conversation lock.
+    // Para membros de grupo de mídia, ajustar o lock para que expire após groupDelayMs
+    // em vez de lockAfterSendMs, garantindo envio rápido entre os itens do grupo.
+    if (isMediaGroupMember) {
+      const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
+      const lockOffset = this.config.perConversation.lockAfterSendMs - groupDelayMs;
+      this.conversationLocks.set(msg.conversationJid, Date.now() - lockOffset);
+    } else {
+      this.conversationLocks.set(msg.conversationJid, Date.now());
+    }
 
     // Track metrics
     this.metrics.sentCount++;
     const actualDelay = Date.now() - msg.enqueuedAt;
     this.totalSentDelay += actualDelay;
     this.metrics.sentDelayAvgMs = this.totalSentDelay / this.metrics.sentCount;
+    this.totalSentDelayByPriority[msg.priority] += actualDelay;
+    this.sentCountByPriority[msg.priority]++;
+    this.metrics.sentDelayAvgByPriority[msg.priority] =
+      this.totalSentDelayByPriority[msg.priority] / this.sentCountByPriority[msg.priority];
 
     // Anti-starvation tracking
     if (msg.priority === 'high' && this.congestionMode === 'critical') {
@@ -697,6 +777,7 @@ export class OutboundQueueManager {
       low: this.countByPriority('low'),
     };
     this.metrics.etaMs = this.getETA();
+    this.metrics.etaFormatted = formatETA(this.metrics.etaMs);
     this.metrics.etaByPriority = this.getETAByPriority();
     this.metrics.congestionMode = this.congestionMode;
 
@@ -715,7 +796,7 @@ export class OutboundQueueManager {
     this.refreshMetrics();
     const m = this.metrics;
     this.logger.info(
-      `[Queue/${this.instanceId}] mode=${m.congestionMode} | pending=${m.queueSize} (H:${m.queueSizeByPriority.high} M:${m.queueSizeByPriority.medium} L:${m.queueSizeByPriority.low}) | ETA=${formatETA(m.etaMs)} | dropped=${m.droppedCount} (5m:${m.droppedLast5min}) | sent=${m.sentCount} | avg_delay=${Math.round(m.sentDelayAvgMs / 1000)}s`,
+      `[Queue/${this.instanceId}] mode=${m.congestionMode} | pending=${m.queueSize} (H:${m.queueSizeByPriority.high} M:${m.queueSizeByPriority.medium} L:${m.queueSizeByPriority.low}) | ETA=${m.etaFormatted} | dropped=${m.droppedCount} (5m:${m.droppedLast5min}) | sent=${m.sentCount} | avg_delay=${Math.round(m.sentDelayAvgMs / 1000)}s (H:${Math.round(m.sentDelayAvgByPriority.high / 1000)}s M:${Math.round(m.sentDelayAvgByPriority.medium / 1000)}s L:${Math.round(m.sentDelayAvgByPriority.low / 1000)}s) | grouped=${m.mediaGroupedCount}`,
     );
   }
 

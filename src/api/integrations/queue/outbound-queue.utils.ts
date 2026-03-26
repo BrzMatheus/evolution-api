@@ -34,6 +34,17 @@ export function isTextMessage(message: any): boolean {
   return !!(message.conversation || message.extendedTextMessage?.text);
 }
 
+export function isMediaMessage(message: any): boolean {
+  if (!message) return false;
+  return !!(message.imageMessage || message.documentMessage);
+}
+
+export function getMediaType(message: any): 'image' | 'document' | null {
+  if (message?.imageMessage) return 'image';
+  if (message?.documentMessage) return 'document';
+  return null;
+}
+
 export function getTextContent(message: any): string | null {
   if (message?.conversation) return message.conversation;
   if (message?.extendedTextMessage?.text) return message.extendedTextMessage.text;

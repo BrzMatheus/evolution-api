@@ -49,6 +49,12 @@ export interface QueueConfig {
     windowMs: number;
     separator: string;
     maxMessages: number;
+    mediaGroup: {
+      enabled: boolean;
+      windowMs: number;
+      maxSize: number;
+      delayMs: number;
+    };
   };
 
   perConversation: {
@@ -98,6 +104,8 @@ export interface QueuedMessage {
   reject: (error: Error) => void;
   consolidatedWith?: string[];
   paused?: boolean;
+  mediaGroupId?: string;
+  isMediaGroupLead?: boolean;
 }
 
 export interface EnqueueParams {
@@ -127,14 +135,17 @@ export interface QueueMetrics {
   queueSize: number;
   queueSizeByPriority: Record<MessagePriority, number>;
   etaMs: number;
+  etaFormatted: string;
   etaByPriority: Record<MessagePriority, number>;
   congestionMode: CongestionMode;
   droppedCount: number;
   droppedLast5min: number;
   sentCount: number;
   sentDelayAvgMs: number;
+  sentDelayAvgByPriority: Record<MessagePriority, number>;
   promotedCount: number;
   consolidatedCount: number;
+  mediaGroupedCount: number;
   modeChanges: number;
 }
 

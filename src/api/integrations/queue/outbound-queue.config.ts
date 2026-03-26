@@ -42,6 +42,12 @@ export const DEFAULT_QUEUE_CONFIG: QueueConfig = {
     windowMs: 8000,
     separator: '\n',
     maxMessages: 5,
+    mediaGroup: {
+      enabled: true,
+      windowMs: 8000,
+      maxSize: 5,
+      delayMs: 1500,
+    },
   },
 
   perConversation: {
@@ -51,7 +57,7 @@ export const DEFAULT_QUEUE_CONFIG: QueueConfig = {
 
   congestion: {
     warnThresholdMs: 600_000, // 10min
-    criticalThresholdMs: 1_200_000, // 20min
+    criticalThresholdMs: 900_000, // 15min (alinhado com maxETAMs)
   },
 
   deduplication: {
@@ -78,7 +84,16 @@ export function mergeQueueConfig(overrides: Partial<QueueConfig>): QueueConfig {
       : DEFAULT_QUEUE_CONFIG.delays,
     sla: { ...DEFAULT_QUEUE_CONFIG.sla, ...overrides.sla },
     maxQueueSize: { ...DEFAULT_QUEUE_CONFIG.maxQueueSize, ...overrides.maxQueueSize },
-    consolidation: { ...DEFAULT_QUEUE_CONFIG.consolidation, ...overrides.consolidation },
+    consolidation: overrides.consolidation
+      ? {
+          ...DEFAULT_QUEUE_CONFIG.consolidation,
+          ...overrides.consolidation,
+          mediaGroup: {
+            ...DEFAULT_QUEUE_CONFIG.consolidation.mediaGroup,
+            ...overrides.consolidation?.mediaGroup,
+          },
+        }
+      : DEFAULT_QUEUE_CONFIG.consolidation,
     perConversation: { ...DEFAULT_QUEUE_CONFIG.perConversation, ...overrides.perConversation },
     congestion: { ...DEFAULT_QUEUE_CONFIG.congestion, ...overrides.congestion },
     deduplication: { ...DEFAULT_QUEUE_CONFIG.deduplication, ...overrides.deduplication },
