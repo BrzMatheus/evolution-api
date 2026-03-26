@@ -53,6 +53,9 @@ export const DEFAULT_QUEUE_CONFIG: QueueConfig = {
   perConversation: {
     minIntervalMs: 20000,
     lockAfterSendMs: 25000,
+    warmWindowMs: 60000, // 1min: janela onde a conversa é considerada "ativa"
+    warmLockAfterSendMs: 3000, // lock curto entre msgs rápidas em conversa quente
+    warmDelayMs: { min: 1000, max: 4000 }, // delay de follow-up em conversa ativa
   },
 
   congestion: {
@@ -94,7 +97,16 @@ export function mergeQueueConfig(overrides: Partial<QueueConfig>): QueueConfig {
           },
         }
       : DEFAULT_QUEUE_CONFIG.consolidation,
-    perConversation: { ...DEFAULT_QUEUE_CONFIG.perConversation, ...overrides.perConversation },
+    perConversation: overrides.perConversation
+      ? {
+          ...DEFAULT_QUEUE_CONFIG.perConversation,
+          ...overrides.perConversation,
+          warmDelayMs: {
+            ...DEFAULT_QUEUE_CONFIG.perConversation.warmDelayMs,
+            ...overrides.perConversation.warmDelayMs,
+          },
+        }
+      : DEFAULT_QUEUE_CONFIG.perConversation,
     congestion: { ...DEFAULT_QUEUE_CONFIG.congestion, ...overrides.congestion },
     deduplication: { ...DEFAULT_QUEUE_CONFIG.deduplication, ...overrides.deduplication },
     typing: { ...DEFAULT_QUEUE_CONFIG.typing, ...overrides.typing },

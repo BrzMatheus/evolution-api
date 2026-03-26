@@ -60,6 +60,9 @@ export interface QueueConfig {
   perConversation: {
     minIntervalMs: number;
     lockAfterSendMs: number;
+    warmWindowMs: number;
+    warmLockAfterSendMs: number;
+    warmDelayMs: DelayRange;
   };
 
   congestion: {

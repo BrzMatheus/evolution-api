@@ -473,12 +473,19 @@ export class OutboundQueueManager {
     // Membros de grupo de mídia (não-líderes) usam delay pequeno sem typing
     const isMediaGroupMember = msg.mediaGroupId && !msg.isMediaGroupLead;
 
+    // Detectar se a conversa está "quente" (envio recente para o mesmo JID)
+    const lockUntil = this.conversationLocks.get(msg.conversationJid);
+    const isWarmConversation =
+      lockUntil !== undefined && Date.now() - lockUntil < this.config.perConversation.warmWindowMs;
+
     if (isMediaGroupMember) {
       const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
       if (groupDelayMs > 0) await sleep(groupDelayMs);
     } else {
-      // Get delay for current mode + priority
-      const delayRange = this.config.delays[this.congestionMode][msg.priority];
+      // Conversa quente → delay curto de follow-up; fria → delay normal por prioridade
+      const delayRange = isWarmConversation
+        ? this.config.perConversation.warmDelayMs
+        : this.config.delays[this.congestionMode][msg.priority];
       const delayMs = this.draining ? Math.min(randomDelay(delayRange), 1000) : randomDelay(delayRange);
 
       // Typing presence
@@ -497,12 +504,15 @@ export class OutboundQueueManager {
     this.removeMessage(msg);
 
     // Update conversation lock.
-    // Para membros de grupo de mídia, ajustar o lock para que expire após groupDelayMs
-    // em vez de lockAfterSendMs, garantindo envio rápido entre os itens do grupo.
+    // Para membros de grupo de mídia, ajustar o lock para que expire após groupDelayMs.
+    // A duração efetiva do lock depende do "calor" da conversa.
     if (isMediaGroupMember) {
       const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
-      const lockOffset = this.config.perConversation.lockAfterSendMs - groupDelayMs;
-      this.conversationLocks.set(msg.conversationJid, Date.now() - lockOffset);
+      const effectiveLockMs = isWarmConversation
+        ? this.config.perConversation.warmLockAfterSendMs
+        : this.config.perConversation.lockAfterSendMs;
+      const lockOffset = effectiveLockMs - groupDelayMs;
+      this.conversationLocks.set(msg.conversationJid, Date.now() - Math.max(0, lockOffset));
     } else {
       this.conversationLocks.set(msg.conversationJid, Date.now());
     }
@@ -588,10 +598,15 @@ export class OutboundQueueManager {
       const idx = (startIdx + i) % len;
       const jid = jids[idx];
 
-      // Check conversation lock
+      // Check conversation lock (warm conversations use shorter lock)
       const lockUntil = this.conversationLocks.get(jid);
-      if (lockUntil && now - lockUntil < this.config.perConversation.lockAfterSendMs) {
-        continue;
+      if (lockUntil) {
+        const timeSince = now - lockUntil;
+        const isWarm = timeSince < this.config.perConversation.warmWindowMs;
+        const effectiveLockMs = isWarm
+          ? this.config.perConversation.warmLockAfterSendMs
+          : this.config.perConversation.lockAfterSendMs;
+        if (timeSince < effectiveLockMs) continue;
       }
 
       const queue = this.queues.get(jid);
