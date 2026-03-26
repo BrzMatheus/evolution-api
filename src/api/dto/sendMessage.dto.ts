@@ -45,6 +45,7 @@ export class Metadata {
   mentioned?: string[];
   encoding?: boolean;
   notConvertSticker?: boolean;
+  priority?: 'high' | 'medium' | 'low';
 }
 
 export class SendTextDto extends Metadata {

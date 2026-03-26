@@ -20,6 +20,7 @@ import { GroupRouter } from './group.router';
 import { InstanceRouter } from './instance.router';
 import { LabelRouter } from './label.router';
 import { ProxyRouter } from './proxy.router';
+import { QueueRouter } from './queue.router';
 import { MessageRouter } from './sendMessage.router';
 import { SettingsRouter } from './settings.router';
 import { TemplateRouter } from './template.router';
@@ -200,6 +201,61 @@ if (metricsConfig.ENABLED) {
           }`,
         );
       }
+
+      // Outbound queue metrics
+      const queueMetrics =
+        instance?.outboundQueue?.isEnabled() && typeof instance?.outboundQueue?.getMetrics === 'function'
+          ? instance.outboundQueue.getMetrics()
+          : null;
+      if (queueMetrics) {
+        const lbl = `instance="${escapeLabel(name)}"`;
+        lines.push(`evolution_queue_size{${lbl}} ${queueMetrics.queueSize}`);
+        lines.push(`evolution_queue_size_high{${lbl}} ${queueMetrics.queueSizeByPriority.high}`);
+        lines.push(`evolution_queue_size_medium{${lbl}} ${queueMetrics.queueSizeByPriority.medium}`);
+        lines.push(`evolution_queue_size_low{${lbl}} ${queueMetrics.queueSizeByPriority.low}`);
+        lines.push(`evolution_queue_eta_seconds{${lbl}} ${(queueMetrics.etaMs / 1000).toFixed(1)}`);
+        lines.push(`evolution_queue_congestion_mode{${lbl},mode="${escapeLabel(queueMetrics.congestionMode)}"} 1`);
+        lines.push(`evolution_queue_dropped_total{${lbl}} ${queueMetrics.droppedCount}`);
+        lines.push(`evolution_queue_dropped_5m{${lbl}} ${queueMetrics.droppedLast5min}`);
+        lines.push(`evolution_queue_sent_total{${lbl}} ${queueMetrics.sentCount}`);
+        lines.push(`evolution_queue_sent_delay_avg_seconds{${lbl}} ${(queueMetrics.sentDelayAvgMs / 1000).toFixed(1)}`);
+        lines.push(`evolution_queue_promoted_total{${lbl}} ${queueMetrics.promotedCount}`);
+        lines.push(`evolution_queue_consolidated_total{${lbl}} ${queueMetrics.consolidatedCount}`);
+        lines.push(`evolution_queue_mode_changes_total{${lbl}} ${queueMetrics.modeChanges}`);
+      }
+    }
+
+    // Queue metric descriptions (outside loop)
+    const anyQueueEnabled = instanceEntries.some(([, inst]) => inst?.outboundQueue?.isEnabled());
+    if (anyQueueEnabled) {
+      lines.unshift(
+        '# HELP evolution_queue_mode_changes_total Total congestion mode transitions',
+        '# TYPE evolution_queue_mode_changes_total counter',
+        '# HELP evolution_queue_consolidated_total Total consolidated messages',
+        '# TYPE evolution_queue_consolidated_total counter',
+        '# HELP evolution_queue_promoted_total Total priority-promoted messages',
+        '# TYPE evolution_queue_promoted_total counter',
+        '# HELP evolution_queue_sent_delay_avg_seconds Average delay from enqueue to send',
+        '# TYPE evolution_queue_sent_delay_avg_seconds gauge',
+        '# HELP evolution_queue_sent_total Total messages sent through queue',
+        '# TYPE evolution_queue_sent_total counter',
+        '# HELP evolution_queue_dropped_5m Messages dropped in last 5 minutes',
+        '# TYPE evolution_queue_dropped_5m gauge',
+        '# HELP evolution_queue_dropped_total Total dropped messages',
+        '# TYPE evolution_queue_dropped_total counter',
+        '# HELP evolution_queue_congestion_mode Current congestion mode',
+        '# TYPE evolution_queue_congestion_mode gauge',
+        '# HELP evolution_queue_eta_seconds Estimated time to drain queue',
+        '# TYPE evolution_queue_eta_seconds gauge',
+        '# HELP evolution_queue_size_low Low priority messages pending',
+        '# TYPE evolution_queue_size_low gauge',
+        '# HELP evolution_queue_size_medium Medium priority messages pending',
+        '# TYPE evolution_queue_size_medium gauge',
+        '# HELP evolution_queue_size_high High priority messages pending',
+        '# TYPE evolution_queue_size_high gauge',
+        '# HELP evolution_queue_size Total messages pending in queue',
+        '# TYPE evolution_queue_size gauge',
+      );
     }
 
     res.send(lines.join('\n') + '\n');
@@ -270,6 +326,7 @@ router
   .use('/settings', new SettingsRouter(...guards).router)
   .use('/proxy', new ProxyRouter(...guards).router)
   .use('/label', new LabelRouter(...guards).router)
+  .use('/queue', new QueueRouter(...guards).router)
   .use('', new ChannelRouter(configService, ...guards).router)
   .use('', new EventRouter(configService, ...guards).router)
   .use('', new ChatbotRouter(...guards).router)

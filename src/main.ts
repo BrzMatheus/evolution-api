@@ -159,6 +159,26 @@ async function bootstrap() {
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
+  // Graceful shutdown: drain outbound queues before exit
+  const gracefulShutdown = async (signal: string) => {
+    logger.info(`${signal} received — draining outbound queues...`);
+    const instances = waMonitor?.waInstances || {};
+    const drainPromises: Promise<void>[] = [];
+    for (const [name, instance] of Object.entries(instances)) {
+      if (instance?.outboundQueue?.isEnabled()) {
+        logger.info(`Draining queue for instance: ${name}`);
+        drainPromises.push(instance.outboundQueue.drain());
+      }
+    }
+    if (drainPromises.length > 0) {
+      await Promise.allSettled(drainPromises);
+    }
+    logger.info('All queues drained. Exiting.');
+    process.exit(0);
+  };
+  process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
+  process.on('SIGINT', () => gracefulShutdown('SIGINT'));
+
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);
   });

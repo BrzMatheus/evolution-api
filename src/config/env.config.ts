@@ -385,6 +385,10 @@ export type Sentry = {
   DSN?: string;
 };
 
+export type OutboundQueue = {
+  ENABLED: boolean;
+};
+
 export type EventEmitter = {
   MAX_LISTENERS: number;
 };
@@ -427,6 +431,7 @@ export interface Env {
   AUDIO_CONVERTER: AudioConverter;
   FACEBOOK: Facebook;
   SENTRY: Sentry;
+  OUTBOUND_QUEUE: OutboundQueue;
   EVENT_EMITTER: EventEmitter;
   PRODUCTION?: Production;
 }
@@ -899,6 +904,9 @@ export class ConfigService {
       },
       SENTRY: {
         DSN: process.env?.SENTRY_DSN,
+      },
+      OUTBOUND_QUEUE: {
+        ENABLED: process.env?.OUTBOUND_QUEUE_ENABLED === 'true',
       },
       EVENT_EMITTER: {
         MAX_LISTENERS: Number.parseInt(process.env?.EVENT_EMITTER_MAX_LISTENERS) || 50,

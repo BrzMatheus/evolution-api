@@ -53,6 +53,9 @@ import {
   TypeButton,
 } from '@api/dto/sendMessage.dto';
 import { chatwootImport } from '@api/integrations/chatbot/chatwoot/utils/chatwoot-import-helper';
+import { DEFAULT_QUEUE_CONFIG } from '@api/integrations/queue/outbound-queue.config';
+import { OutboundQueueManager } from '@api/integrations/queue/outbound-queue.manager';
+import { detectPriority } from '@api/integrations/queue/outbound-queue.utils';
 import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository, Query } from '@api/repository/repository.service';
@@ -72,6 +75,7 @@ import {
   Database,
   Log,
   Openai,
+  OutboundQueue,
   ProviderSession,
   QrCode,
   S3,
@@ -266,6 +270,7 @@ export class BaileysStartupService extends ChannelStartupService {
   private readonly unresolvedUpdateTimestamps: number[] = [];
   private readonly sessionErrorTimestamps: number[] = [];
   private readonly sessionErrorsByPeer = new Map<string, number[]>();
+  public outboundQueue: OutboundQueueManager | null = null;
 
   constructor(
     public readonly configService: ConfigService,
@@ -285,6 +290,18 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.authStateProvider = new AuthStateProvider(this.providerFiles);
     this.startFunctionalWatchdog();
+
+    // Initialize outbound queue manager if enabled
+    const queueEnabled = this.configService.get<OutboundQueue>('OUTBOUND_QUEUE')?.ENABLED;
+    if (queueEnabled) {
+      this.outboundQueue = new OutboundQueueManager({
+        instanceId: this.instanceId || 'unknown',
+        config: { ...DEFAULT_QUEUE_CONFIG, enabled: true },
+        sendFn: this.executeSend.bind(this),
+        clientFn: () => this.client,
+        logger: this.logger,
+      });
+    }
   }
 
   private authStateProvider: AuthStateProvider;
@@ -3180,6 +3197,26 @@ export class BaileysStartupService extends ChannelStartupService {
 
     this.logger.verbose(`Sending message to ${sender}`);
 
+    // If queue is disabled, execute directly (backward compatible)
+    if (!this.outboundQueue?.isEnabled()) {
+      return this.executeSend(sender, message, options, isIntegration);
+    }
+
+    // Enqueue and return Promise that resolves when message is actually sent
+    const priority = (options as any)?.priority || detectPriority(message, isIntegration);
+
+    return this.outboundQueue.enqueue({
+      instanceId: this.instanceId,
+      conversationJid: sender,
+      priority,
+      isIntegration,
+      sender,
+      message,
+      options,
+    });
+  }
+
+  private async executeSend<T = proto.IMessage>(sender: string, message: T, options?: Options, isIntegration = false) {
     try {
       if (options?.delay) {
         this.logger.verbose(`Typing for ${options.delay}ms to ${sender}`);
