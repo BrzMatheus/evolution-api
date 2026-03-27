@@ -179,6 +179,23 @@ async function bootstrap() {
   process.on('SIGTERM', () => gracefulShutdown('SIGTERM'));
   process.on('SIGINT', () => gracefulShutdown('SIGINT'));
 
+  // Synchronous exit hook: log pending queue state on forced/unexpected exit
+  process.on('exit', (code) => {
+    if (code !== 0) {
+      const instances = waMonitor?.waInstances || {};
+      for (const [name, instance] of Object.entries(instances)) {
+        if (instance?.outboundQueue?.isEnabled()) {
+          const metrics = instance.outboundQueue.getMetrics();
+          if (metrics.queueSize > 0) {
+            logger.warn(
+              `[Shutdown] Instance ${name}: ${metrics.queueSize} messages lost in queue (sent=${metrics.sentCount}, dropped=${metrics.droppedCount})`,
+            );
+          }
+        }
+      }
+    }
+  });
+
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);
   });

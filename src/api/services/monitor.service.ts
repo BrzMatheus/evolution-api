@@ -396,6 +396,10 @@ export class WAMonitoringService {
 
         this.clearDelInstanceTime(instanceName);
 
+        if (this.waInstances[instanceName]?.outboundQueue?.isEnabled()) {
+          this.waInstances[instanceName].outboundQueue.destroy();
+        }
+
         this.cleaningUp(instanceName);
         this.cleaningStoreData(instanceName);
       } finally {
@@ -416,6 +420,10 @@ export class WAMonitoringService {
 
         if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) {
           this.waInstances[instanceName]?.clearCacheChatwoot();
+        }
+
+        if (this.waInstances[instanceName]?.outboundQueue?.isEnabled()) {
+          this.waInstances[instanceName].outboundQueue.destroy();
         }
 
         this.cleaningUp(instanceName);

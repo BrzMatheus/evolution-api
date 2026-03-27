@@ -195,7 +195,10 @@ export class OutboundQueueManager {
     const currentCount = this.countByPriority(priority);
     if (currentCount >= this.config.maxQueueSize[priority]) {
       if (priority === 'high') {
-        // high never blocks
+        const hardCap = this.config.maxQueueSize[priority] * 4;
+        if (currentCount >= hardCap) {
+          return this.createDroppedResult(params, 'queue_congestion');
+        }
       } else if (priority === 'medium' && this.congestionMode === 'critical') {
         return this.createDroppedResult(params, 'queue_congestion');
       } else if (priority === 'low' && this.congestionMode !== 'normal') {
@@ -309,16 +312,32 @@ export class OutboundQueueManager {
     // Update hash
     target.contentHash = contentHash(target.message);
 
-    // Chain the new message's promise to the target
+    // Chain the new message's promise to the target (defensive: isolate each callback)
     const originalResolve = target.resolve;
     target.resolve = (value: any) => {
-      originalResolve(value);
-      msg.resolve(value);
+      try {
+        originalResolve(value);
+      } catch {
+        void 0;
+      }
+      try {
+        msg.resolve(value);
+      } catch {
+        void 0;
+      }
     };
     const originalReject = target.reject;
     target.reject = (error: Error) => {
-      originalReject(error);
-      msg.reject(error);
+      try {
+        originalReject(error);
+      } catch {
+        void 0;
+      }
+      try {
+        msg.reject(error);
+      } catch {
+        void 0;
+      }
     };
 
     this.metrics.consolidatedCount++;
@@ -427,41 +446,60 @@ export class OutboundQueueManager {
   }
 
   private async processLoop(): Promise<void> {
-    while (this.workerRunning) {
-      const msg = this.selectNext();
-      if (!msg) {
-        if (this.getTotalPending() > 0) {
-          // Mensagens existem mas temporariamente inacessíveis (conversa locked ou pausadas).
-          // Atualizar modo de congestionamento pode resumir pausadas; o sleep aguarda o lock expirar.
-          this.updateCongestionMode();
-          await sleep(2000);
-          continue;
+    try {
+      while (this.workerRunning) {
+        const msg = this.selectNext();
+        if (!msg) {
+          if (this.getTotalPending() > 0) {
+            // Mensagens existem mas temporariamente inacessíveis (conversa locked ou pausadas).
+            // Atualizar modo de congestionamento pode resumir pausadas; o sleep aguarda o lock expirar.
+            this.updateCongestionMode();
+            await sleep(2000);
+            continue;
+          }
+          this.workerRunning = false;
+          break;
         }
-        this.workerRunning = false;
-        break;
+
+        try {
+          await this.processMessage(msg);
+        } catch (error) {
+          this.logger.error(`[Queue] Error processing message ${msg.id}: ${error?.message}`);
+          try {
+            msg.reject(error instanceof Error ? error : new Error(String(error)));
+          } catch {
+            // reject callback itself failed — nothing more to do
+          }
+          this.removeMessage(msg);
+        }
+
+        this.processedSinceLastLog++;
+        if (this.processedSinceLastLog >= METRICS_LOG_INTERVAL) {
+          this.logMetrics();
+          this.processedSinceLastLog = 0;
+        }
+
+        // Recalculate congestion after each send
+        this.updateCongestionMode();
+
+        // If queue is empty, stop
+        if (this.getTotalPending() === 0) {
+          this.workerRunning = false;
+          break;
+        }
       }
-
-      try {
-        await this.processMessage(msg);
-      } catch (error) {
-        this.logger.error(`[Queue] Error processing message ${msg.id}: ${error?.message}`);
-        msg.reject(error instanceof Error ? error : new Error(String(error)));
-        this.removeMessage(msg);
-      }
-
-      this.processedSinceLastLog++;
-      if (this.processedSinceLastLog >= METRICS_LOG_INTERVAL) {
-        this.logMetrics();
-        this.processedSinceLastLog = 0;
-      }
-
-      // Recalculate congestion after each send
-      this.updateCongestionMode();
-
-      // If queue is empty, stop
-      if (this.getTotalPending() === 0) {
-        this.workerRunning = false;
-        break;
+    } catch (error) {
+      this.logger.error(
+        `[Queue/${this.instanceId}] Worker loop crashed unexpectedly: ${error instanceof Error ? error.message : String(error)}`,
+      );
+    } finally {
+      this.workerRunning = false;
+      // Safety net: restart worker if messages remain (e.g. after unexpected crash)
+      if (this.getTotalPending() > 0 && !this.draining) {
+        this.logger.warn(
+          `[Queue/${this.instanceId}] Worker restarting after exit (${this.getTotalPending()} messages pending)`,
+        );
+        this.ensureWorkerRunning();
       }
     }
   }
@@ -851,6 +889,16 @@ export class OutboundQueueManager {
         this.recentHashes.delete(key);
       }
     }
+    this.cleanExpiredLocks(now);
+  }
+
+  private cleanExpiredLocks(now: number): void {
+    const maxAge = this.config.perConversation.lockAfterSendMs * 2;
+    for (const [jid, ts] of this.conversationLocks) {
+      if (now - ts > maxAge) {
+        this.conversationLocks.delete(jid);
+      }
+    }
   }
 
   // ─── DRAIN (graceful shutdown) ──────────────────────────────
@@ -858,6 +906,9 @@ export class OutboundQueueManager {
   async drain(): Promise<void> {
     this.draining = true;
     this.logger.info(`[Queue/${this.instanceId}] Draining queue (${this.getTotalPending()} messages remaining)`);
+
+    // Ensure worker is active so pending messages get processed during drain
+    this.ensureWorkerRunning();
 
     // Process remaining with minimal delays
     const timeout = setTimeout(() => {
@@ -876,6 +927,14 @@ export class OutboundQueueManager {
   }
 
   private forceResolveAll(): void {
+    const pending = this.getTotalPending();
+    if (pending > 0) {
+      this.refreshMetrics();
+      this.logger.warn(
+        `[Queue/${this.instanceId}] Force-resolving ${pending} messages on shutdown | sent=${this.metrics.sentCount} dropped=${this.metrics.droppedCount}`,
+      );
+    }
+
     for (const [, msgs] of this.queues) {
       for (const msg of [...msgs]) {
         msg.resolve({
