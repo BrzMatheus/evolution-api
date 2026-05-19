@@ -1,4 +1,4 @@
-import {
+﻿import {
   CongestionMode,
   DroppedResult,
   EnqueueParams,
@@ -22,14 +22,14 @@ import {
 
 const PRIORITIES: MessagePriority[] = ['high', 'medium', 'low'];
 const ANTI_STARVATION_RATIO = 5; // a cada 5 high, permite 1 medium em critical
-const METRICS_LOG_INTERVAL = 10; // loga métricas a cada N mensagens processadas
+const METRICS_LOG_INTERVAL = 10; // loga mÃ©tricas a cada N mensagens processadas
 
 export class OutboundQueueManager {
   // Per-conversation sub-queues
   private queues: Map<string, QueuedMessage[]> = new Map();
-  // Conversation locks: jid → timestamp do último envio
+  // Conversation locks: jid â†’ timestamp do Ãºltimo envio
   private conversationLocks: Map<string, number> = new Map();
-  // Dedup: hash+jid → timestamp
+  // Dedup: hash+jid â†’ timestamp
   private recentHashes: Map<string, number> = new Map();
   // Round-robin index per priority
   private roundRobinIndex: Map<MessagePriority, number> = new Map([
@@ -72,7 +72,13 @@ export class OutboundQueueManager {
 
   private readonly instanceId: string;
   private config: QueueConfig;
-  private readonly sendFn: (sender: string, message: any, options: any, isIntegration: boolean) => Promise<any>;
+  private readonly sendFn: (
+    sender: string,
+    message: any,
+    options: any,
+    isIntegration: boolean,
+    additionalNodes?: any,
+  ) => Promise<any>;
   private readonly clientFn: () => any;
   private readonly logger: any;
 
@@ -124,7 +130,7 @@ export class OutboundQueueManager {
     return this.congestionMode;
   }
 
-  // ─── ENQUEUE ────────────────────────────────────────────────
+  // â”€â”€â”€ ENQUEUE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async enqueue(params: EnqueueParams): Promise<any> {
     const { conversationJid, priority } = params;
@@ -157,6 +163,7 @@ export class OutboundQueueManager {
         messageId: params.messageId,
         ephemeralExpiration: params.ephemeralExpiration,
         contextInfo: params.contextInfo,
+        additionalNodes: params.additionalNodes,
         resolve,
         reject,
       };
@@ -186,7 +193,7 @@ export class OutboundQueueManager {
     });
   }
 
-  // ─── BACKPRESSURE ───────────────────────────────────────────
+  // â”€â”€â”€ BACKPRESSURE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private checkBackpressure(params: EnqueueParams): DroppedResult | null {
     const { priority, conversationJid } = params;
@@ -247,7 +254,7 @@ export class OutboundQueueManager {
     return result;
   }
 
-  // ─── DEDUPLICATION ──────────────────────────────────────────
+  // â”€â”€â”€ DEDUPLICATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private checkDeduplication(params: EnqueueParams): DroppedResult | null {
     if (!this.config.deduplication.enabled) return null;
@@ -269,7 +276,7 @@ export class OutboundQueueManager {
     return null;
   }
 
-  // ─── CONSOLIDATION ─────────────────────────────────────────
+  // â”€â”€â”€ CONSOLIDATION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private tryConsolidate(msg: QueuedMessage): boolean {
     if (!this.config.consolidation.enabled) return false;
@@ -357,7 +364,7 @@ export class OutboundQueueManager {
     const conversationQueue = this.queues.get(msg.conversationJid);
     if (!conversationQueue || conversationQueue.length === 0) return;
 
-    // Encontrar líder: último media do mesmo tipo na mesma conversa dentro da janela
+    // Encontrar lÃ­der: Ãºltimo media do mesmo tipo na mesma conversa dentro da janela
     const lead = [...conversationQueue]
       .reverse()
       .find(
@@ -371,7 +378,7 @@ export class OutboundQueueManager {
 
     if (!lead) return;
 
-    // Marcar líder se ainda não marcado
+    // Marcar lÃ­der se ainda nÃ£o marcado
     if (!lead.mediaGroupId) {
       lead.mediaGroupId = lead.id;
       lead.isMediaGroupLead = true;
@@ -381,7 +388,7 @@ export class OutboundQueueManager {
     msg.mediaGroupId = lead.mediaGroupId;
     msg.isMediaGroupLead = false;
 
-    // Usar consolidatedWith apenas como contador de membros (sem merge de conteúdo)
+    // Usar consolidatedWith apenas como contador de membros (sem merge de conteÃºdo)
     if (!lead.consolidatedWith) lead.consolidatedWith = [];
     lead.consolidatedWith.push(msg.id);
 
@@ -391,7 +398,7 @@ export class OutboundQueueManager {
     );
   }
 
-  // ─── QUEUE MANAGEMENT ──────────────────────────────────────
+  // â”€â”€â”€ QUEUE MANAGEMENT â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private insertMessage(msg: QueuedMessage): void {
     const jid = msg.conversationJid;
@@ -437,7 +444,7 @@ export class OutboundQueueManager {
     return Array.from(this.queues.keys());
   }
 
-  // ─── WORKER ─────────────────────────────────────────────────
+  // â”€â”€â”€ WORKER â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private ensureWorkerRunning(): void {
     if (this.workerRunning) return;
@@ -451,7 +458,7 @@ export class OutboundQueueManager {
         const msg = this.selectNext();
         if (!msg) {
           if (this.getTotalPending() > 0) {
-            // Mensagens existem mas temporariamente inacessíveis (conversa locked ou pausadas).
+            // Mensagens existem mas temporariamente inacessÃ­veis (conversa locked ou pausadas).
             // Atualizar modo de congestionamento pode resumir pausadas; o sleep aguarda o lock expirar.
             this.updateCongestionMode();
             await sleep(2000);
@@ -468,7 +475,7 @@ export class OutboundQueueManager {
           try {
             msg.reject(error instanceof Error ? error : new Error(String(error)));
           } catch {
-            // reject callback itself failed — nothing more to do
+            // reject callback itself failed â€” nothing more to do
           }
           this.removeMessage(msg);
         }
@@ -508,10 +515,10 @@ export class OutboundQueueManager {
     // Check deadline - promote or fast-track
     this.checkDeadline(msg);
 
-    // Membros de grupo de mídia (não-líderes) usam delay pequeno sem typing
+    // Membros de grupo de mÃ­dia (nÃ£o-lÃ­deres) usam delay pequeno sem typing
     const isMediaGroupMember = msg.mediaGroupId && !msg.isMediaGroupLead;
 
-    // Detectar se a conversa está "quente" (envio recente para o mesmo JID)
+    // Detectar se a conversa estÃ¡ "quente" (envio recente para o mesmo JID)
     const lockUntil = this.conversationLocks.get(msg.conversationJid);
     const isWarmConversation =
       lockUntil !== undefined && Date.now() - lockUntil < this.config.perConversation.warmWindowMs;
@@ -520,7 +527,7 @@ export class OutboundQueueManager {
       const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
       if (groupDelayMs > 0) await sleep(groupDelayMs);
     } else {
-      // Conversa quente → delay curto de follow-up; fria → delay normal por prioridade
+      // Conversa quente â†’ delay curto de follow-up; fria â†’ delay normal por prioridade
       const delayRange = isWarmConversation
         ? this.config.perConversation.warmDelayMs
         : this.config.delays[this.congestionMode][msg.priority];
@@ -542,8 +549,8 @@ export class OutboundQueueManager {
     this.removeMessage(msg);
 
     // Update conversation lock.
-    // Para membros de grupo de mídia, ajustar o lock para que expire após groupDelayMs.
-    // A duração efetiva do lock depende do "calor" da conversa.
+    // Para membros de grupo de mÃ­dia, ajustar o lock para que expire apÃ³s groupDelayMs.
+    // A duraÃ§Ã£o efetiva do lock depende do "calor" da conversa.
     if (isMediaGroupMember) {
       const groupDelayMs = this.config.consolidation.mediaGroup.delayMs;
       const effectiveLockMs = isWarmConversation
@@ -577,7 +584,7 @@ export class OutboundQueueManager {
     const MAX_ATTEMPTS = 3;
     for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
       try {
-        return await this.sendFn(msg.sender, msg.message, msg.options, msg.isIntegration);
+        return await this.sendFn(msg.sender, msg.message, msg.options, msg.isIntegration, msg.additionalNodes);
       } catch (error) {
         const err = error instanceof Error ? error : new Error(String(error));
         if (attempt < MAX_ATTEMPTS && isTransientError(err)) {
@@ -660,7 +667,7 @@ export class OutboundQueueManager {
     return null;
   }
 
-  // ─── DEADLINE & PRIORITY PROMOTION ─────────────────────────
+  // â”€â”€â”€ DEADLINE & PRIORITY PROMOTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private checkDeadline(msg: QueuedMessage): void {
     const now = Date.now();
@@ -673,17 +680,17 @@ export class OutboundQueueManager {
         msg.priority = 'medium';
         msg.deadlineAt = now + this.config.sla.medium;
         this.metrics.promotedCount++;
-        this.logger.verbose(`[Queue] Promoted ${msg.id} from low → medium (deadline approaching)`);
+        this.logger.verbose(`[Queue] Promoted ${msg.id} from low â†’ medium (deadline approaching)`);
       } else if (msg.priority === 'medium') {
         msg.priority = 'high';
         msg.deadlineAt = now + this.config.sla.high;
         this.metrics.promotedCount++;
-        this.logger.verbose(`[Queue] Promoted ${msg.id} from medium → high (deadline approaching)`);
+        this.logger.verbose(`[Queue] Promoted ${msg.id} from medium â†’ high (deadline approaching)`);
       }
     }
   }
 
-  // ─── TYPING PRESENCE ───────────────────────────────────────
+  // â”€â”€â”€ TYPING PRESENCE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private async sendTyping(sender: string, durationMs: number): Promise<void> {
     try {
@@ -731,7 +738,7 @@ export class OutboundQueueManager {
     }
   }
 
-  // ─── CONGESTION ─────────────────────────────────────────────
+  // â”€â”€â”€ CONGESTION â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   getETA(): number {
     const delays = this.config.delays[this.congestionMode];
@@ -781,19 +788,19 @@ export class OutboundQueueManager {
 
     if (next === 'congested') {
       this.pauseByPriority('low');
-      this.logger.warn(`[Queue/${this.instanceId}] Mode: ${prev} → CONGESTED | ETA: ${formatETA(eta)}`);
+      this.logger.warn(`[Queue/${this.instanceId}] Mode: ${prev} â†’ CONGESTED | ETA: ${formatETA(eta)}`);
     }
 
     if (next === 'critical') {
       this.pauseByPriority('low');
       this.pauseByPriority('medium');
       this.dropExcessMessages();
-      this.logger.error(`[Queue/${this.instanceId}] Mode: ${prev} → CRITICAL | ETA: ${formatETA(eta)}`);
+      this.logger.error(`[Queue/${this.instanceId}] Mode: ${prev} â†’ CRITICAL | ETA: ${formatETA(eta)}`);
     }
 
     if (next === 'normal' && prev !== 'normal') {
       this.resumeAll();
-      this.logger.info(`[Queue/${this.instanceId}] Mode: ${prev} → NORMAL | ETA: ${formatETA(eta)}`);
+      this.logger.info(`[Queue/${this.instanceId}] Mode: ${prev} â†’ NORMAL | ETA: ${formatETA(eta)}`);
     }
 
     this.logMetrics();
@@ -846,7 +853,7 @@ export class OutboundQueueManager {
     }
   }
 
-  // ─── METRICS ────────────────────────────────────────────────
+  // â”€â”€â”€ METRICS â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private refreshMetrics(): void {
     this.metrics.queueSize = this.getTotalPending();
@@ -879,7 +886,7 @@ export class OutboundQueueManager {
     );
   }
 
-  // ─── CLEANUP ────────────────────────────────────────────────
+  // â”€â”€â”€ CLEANUP â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   private cleanExpiredHashes(): void {
     const now = Date.now();
@@ -901,7 +908,7 @@ export class OutboundQueueManager {
     }
   }
 
-  // ─── DRAIN (graceful shutdown) ──────────────────────────────
+  // â”€â”€â”€ DRAIN (graceful shutdown) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 
   async drain(): Promise<void> {
     this.draining = true;

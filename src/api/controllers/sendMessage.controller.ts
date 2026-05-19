@@ -2,6 +2,7 @@ import { InstanceDto } from '@api/dto/instance.dto';
 import {
   SendAudioDto,
   SendButtonsDto,
+  SendCarouselDto,
   SendContactDto,
   SendListDto,
   SendLocationDto,
@@ -84,6 +85,10 @@ export class SendMessageController {
 
   public async sendList({ instanceName }: InstanceDto, data: SendListDto) {
     return await this.waMonitor.waInstances[instanceName].listMessage(data);
+  }
+
+  public async sendCarousel({ instanceName }: InstanceDto, data: SendCarouselDto) {
+    return await this.waMonitor.waInstances[instanceName].carouselMessage(data);
   }
 
   public async sendContact({ instanceName }: InstanceDto, data: SendContactDto) {

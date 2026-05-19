@@ -2,10 +2,12 @@ import { RouterBroker } from '@api/abstract/abstract.router';
 import {
   ArchiveChatDto,
   BlockUserDto,
+  DecryptPollVoteDto,
   DeleteMessage,
   FetchBulkHistoryDto,
   getBase64FromMediaMessageDto,
   MarkChatUnreadDto,
+  MarkMessageAsPlayedDto,
   NumberDto,
   PrivacySettingDto,
   ProfileNameDto,
@@ -24,9 +26,12 @@ import {
   archiveChatSchema,
   blockUserSchema,
   contactValidateSchema,
+  decryptPollVoteSchema,
   deleteMessageSchema,
   fetchBulkHistorySchema,
+  fetchLidSchema,
   markChatUnreadSchema,
+  markMessageAsPlayedSchema,
   messageUpSchema,
   messageValidateSchema,
   presenceSchema,
@@ -68,6 +73,16 @@ export class ChatRouter extends RouterBroker {
           schema: readMessageSchema,
           ClassRef: ReadMessageDto,
           execute: (instance, data) => chatController.readMessage(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('markMessageAsPlayed'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<MarkMessageAsPlayedDto>({
+          request: req,
+          schema: markMessageAsPlayedSchema,
+          ClassRef: MarkMessageAsPlayedDto,
+          execute: (instance, data) => chatController.markMessageAsPlayed(instance, data),
         });
 
         return res.status(HttpStatus.CREATED).json(response);
@@ -224,6 +239,16 @@ export class ChatRouter extends RouterBroker {
 
         return res.status(HttpStatus.OK).json(response);
       })
+      .post(this.routerPath('fetchLid'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<NumberDto>({
+          request: req,
+          schema: fetchLidSchema,
+          ClassRef: NumberDto,
+          execute: (instance, data) => chatController.fetchLid(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
       .post(this.routerPath('updateProfileName'), ...guards, async (req, res) => {
         const response = await this.dataValidate<ProfileNameDto>({
           request: req,
@@ -313,6 +338,26 @@ export class ChatRouter extends RouterBroker {
         });
 
         return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('getPollVote'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<DecryptPollVoteDto>({
+          request: req,
+          schema: decryptPollVoteSchema,
+          ClassRef: DecryptPollVoteDto,
+          execute: (instance, data) => chatController.decryptPollVote(instance, data),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
+      })
+      .post(this.routerPath('findChannels'), ...guards, async (req, res) => {
+        const response = await this.dataValidate({
+          request: req,
+          schema: contactValidateSchema,
+          ClassRef: Query<Contact>,
+          execute: (instance, query) => chatController.fetchChannels(instance, query as any),
+        });
+
+        return res.status(HttpStatus.OK).json(response);
       });
   }
 

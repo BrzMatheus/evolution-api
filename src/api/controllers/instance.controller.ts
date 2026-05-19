@@ -36,6 +36,8 @@ export class InstanceController {
 
   public async createInstance(instanceData: InstanceDto) {
     try {
+      instanceData.instanceName = instanceData.instanceName?.trim();
+
       const instance = channelController.init(instanceData, {
         configService: this.configService,
         eventEmitter: this.eventEmitter,
@@ -154,6 +156,10 @@ export class InstanceController {
           await instance.connectToWhatsapp(instanceData.number);
           await delay(5000);
           getQrcode = instance.qrCode;
+        }
+
+        if (instanceData.integration === Integration.EVOLUTION) {
+          await instance.connectToWhatsapp();
         }
 
         const result = {
@@ -436,8 +442,10 @@ export class InstanceController {
   public async logout({ instanceName }: InstanceDto) {
     const { instance } = await this.connectionState({ instanceName });
 
+    // Idempotente: se já está desconectada, retorna sucesso silenciosamente.
+    // Evita falhar o fluxo de delete do painel, que sempre chama logout antes do delete.
     if (instance.state === 'close') {
-      throw new BadRequestException('The "' + instanceName + '" instance is not connected');
+      return { status: 'SUCCESS', error: false, response: { message: 'Instance was already disconnected' } };
     }
 
     try {
@@ -456,7 +464,21 @@ export class InstanceController {
       if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED) waInstances?.clearCacheChatwoot();
 
       if (instance.state === 'connecting' || instance.state === 'open') {
-        await this.logout({ instanceName });
+        try {
+          await this.logout({ instanceName });
+        } catch (error) {
+          // logout can throw "Connection Closed" when the underlying Baileys
+          // socket is already dead but waInstances[name] still exists. We
+          // must continue to the remove.instance emit below — that is the
+          // only path that purges the in-memory entry and runs cleaningUp().
+          // Without this catch, the stale entry persists until the entire
+          // process restarts.
+          this.logger.warn({
+            message: 'logout failed during deleteInstance — proceeding with cleanup',
+            instanceName,
+            error,
+          });
+        }
       }
 
       try {

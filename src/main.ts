@@ -5,6 +5,7 @@ import '@utils/instrumentSentry';
 import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { HttpStatus, router } from '@api/routes/index.router';
+import { buildLicenseRouter } from '@api/routes/license.router';
 import { eventManager, waMonitor } from '@api/server.module';
 import {
   Auth,
@@ -18,6 +19,8 @@ import {
 import { onUnexpectedError } from '@config/error.config';
 import { Logger } from '@config/logger.config';
 import { ROOT_DIR } from '@config/path.config';
+import { gateMiddleware, initializeRuntime, shutdown, startHeartbeat } from '@licensing/runtime';
+import { setDB } from '@licensing/store';
 import * as Sentry from '@sentry/node';
 import { ServerUP } from '@utils/server-up';
 import axios from 'axios';
@@ -44,6 +47,17 @@ async function bootstrap() {
   const prismaRepository = new PrismaRepository(configService);
   await prismaRepository.onModuleInit();
 
+  // Licensing — must be initialized after Prisma is connected and BEFORE any
+  // business router is registered. The gate middleware sits in front of routes
+  // and returns 503 LICENSE_REQUIRED if the license is not active yet.
+  setDB(prismaRepository);
+  const licensingRC = await initializeRuntime({
+    tier: 'evolution-api',
+    version: process.env.npm_package_version || 'unknown',
+    globalApiKey: configService.get<Auth>('AUTHENTICATION').API_KEY.KEY,
+  });
+  const startedAt = new Date();
+
   app.use(
     cors({
       origin(requestOrigin, callback) {
@@ -69,6 +83,10 @@ async function bootstrap() {
   app.use(express.static(join(ROOT_DIR, 'public')));
 
   app.use('/store', express.static(join(ROOT_DIR, 'store')));
+
+  // Licensing — public routes (always work) and gate middleware (blocks rest).
+  app.use('/license', buildLicenseRouter(licensingRC));
+  app.use(gateMiddleware(licensingRC));
 
   app.use('/', router);
 
@@ -159,6 +177,9 @@ async function bootstrap() {
 
   server.listen(httpServer.PORT, () => logger.log(httpServer.TYPE.toUpperCase() + ' - ON: ' + httpServer.PORT));
 
+  // Start licensing heartbeat (30 min) - fire-and-forget.
+  startHeartbeat(licensingRC, startedAt);
+
   // Graceful shutdown: drain outbound queues before exit
   const gracefulShutdown = async (signal: string) => {
     logger.info(`${signal} received — draining outbound queues...`);
@@ -173,6 +194,7 @@ async function bootstrap() {
     if (drainPromises.length > 0) {
       await Promise.allSettled(drainPromises);
     }
+    await shutdown(licensingRC);
     logger.info('All queues drained. Exiting.');
     process.exit(0);
   };
@@ -195,6 +217,7 @@ async function bootstrap() {
       }
     }
   });
+  // Start licensing heartbeat (30 min) — fire-and-forget.
 
   initWA().catch((error) => {
     logger.error('Error loading instances: ' + error);

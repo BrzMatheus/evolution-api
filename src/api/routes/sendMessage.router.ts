@@ -2,6 +2,7 @@ import { RouterBroker } from '@api/abstract/abstract.router';
 import {
   SendAudioDto,
   SendButtonsDto,
+  SendCarouselDto,
   SendContactDto,
   SendListDto,
   SendLocationDto,
@@ -18,6 +19,7 @@ import { sendMessageController } from '@api/server.module';
 import {
   audioMessageSchema,
   buttonsMessageSchema,
+  carouselMessageSchema,
   contactMessageSchema,
   listMessageSchema,
   locationMessageSchema,
@@ -178,6 +180,16 @@ export class MessageRouter extends RouterBroker {
           schema: buttonsMessageSchema,
           ClassRef: SendButtonsDto,
           execute: (instance, data) => sendMessageController.sendButtons(instance, data),
+        });
+
+        return res.status(HttpStatus.CREATED).json(response);
+      })
+      .post(this.routerPath('sendCarousel'), ...guards, async (req, res) => {
+        const response = await this.dataValidate<SendCarouselDto>({
+          request: req,
+          schema: carouselMessageSchema,
+          ClassRef: SendCarouselDto,
+          execute: (instance, data) => sendMessageController.sendCarousel(instance, data),
         });
 
         return res.status(HttpStatus.CREATED).json(response);

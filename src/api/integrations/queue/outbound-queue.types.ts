@@ -1,4 +1,4 @@
-export type MessagePriority = 'high' | 'medium' | 'low';
+﻿export type MessagePriority = 'high' | 'medium' | 'low';
 
 export type CongestionMode = 'normal' | 'congested' | 'critical';
 
@@ -101,6 +101,7 @@ export interface QueuedMessage {
   messageId?: string;
   ephemeralExpiration?: number;
   contextInfo?: any;
+  additionalNodes?: any;
 
   // Internal control
   resolve: (value: any) => void;
@@ -125,6 +126,7 @@ export interface EnqueueParams {
   messageId?: string;
   ephemeralExpiration?: number;
   contextInfo?: any;
+  additionalNodes?: any;
 }
 
 export interface DroppedResult {
@@ -155,7 +157,7 @@ export interface QueueMetrics {
 export interface QueueManagerOptions {
   instanceId: string;
   config: QueueConfig;
-  sendFn: (sender: string, message: any, options: any, isIntegration: boolean) => Promise<any>;
+  sendFn: (sender: string, message: any, options: any, isIntegration: boolean, additionalNodes?: any) => Promise<any>;
   clientFn: () => {
     presenceSubscribe: (jid: string) => Promise<void>;
     sendPresenceUpdate: (type: string, jid: string) => Promise<void>;

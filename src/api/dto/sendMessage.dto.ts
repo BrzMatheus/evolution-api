@@ -14,6 +14,7 @@ export class Options {
   mentionsEveryOne?: boolean;
   mentioned?: string[];
   webhookUrl?: string;
+  messageId?: string;
 }
 
 export class MediaMessage {
@@ -24,6 +25,8 @@ export class MediaMessage {
   fileName?: string;
   // url or base64
   media: string;
+  gifPlayback?: boolean | string;
+  gifAttribution?: number | string;
 }
 
 export class StatusMessage {
@@ -46,6 +49,7 @@ export class Metadata {
   encoding?: boolean;
   notConvertSticker?: boolean;
   priority?: 'high' | 'medium' | 'low';
+  messageId?: string;
 }
 
 export class SendTextDto extends Metadata {
@@ -82,6 +86,8 @@ export class SendMediaDto extends Metadata {
   fileName?: string;
   // url or base64
   media: string;
+  gifPlayback?: boolean | string;
+  gifAttribution?: number | string;
 }
 
 export class SendPtvDto extends Metadata {
@@ -167,4 +173,17 @@ export class SendContactDto extends Metadata {
 export class SendReactionDto {
   key: proto.IMessageKey;
   reaction: string;
+}
+
+export class CarouselCard {
+  title?: string;
+  body: string;
+  footer?: string;
+  imageUrl?: string;
+  buttons: Button[];
+}
+
+export class SendCarouselDto extends Metadata {
+  body: string;
+  cards: CarouselCard[];
 }

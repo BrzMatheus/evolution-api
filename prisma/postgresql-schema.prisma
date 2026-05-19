@@ -125,7 +125,7 @@ model Instance {
   integration             String?                  @db.VarChar(100)
   number                  String?                  @db.VarChar(100)
   businessId              String?                  @db.VarChar(100)
-  token                   String?                  @db.VarChar(255)
+  token                   String?                  @db.VarChar(500)
   clientName              String?                  @db.VarChar(100)
   disconnectionReasonCode Int?                     @db.Integer
   disconnectionObject     Json?                    @db.JsonB
@@ -889,4 +889,12 @@ model EvoaiSetting {
   evoaiIdFallback String?   @db.VarChar(100)
   Instance        Instance  @relation(fields: [instanceId], references: [id], onDelete: Cascade)
   instanceId      String    @unique
+}
+
+model RuntimeConfig {
+  id        Int      @id @default(autoincrement())
+  key       String   @unique @db.VarChar(100)
+  value     String   @db.Text
+  createdAt DateTime @default(now()) @db.Timestamp
+  updatedAt DateTime @updatedAt @db.Timestamp
 }

@@ -70,6 +70,10 @@ export class ReadMessageDto {
   readMessages: Key[];
 }
 
+export class MarkMessageAsPlayedDto {
+  playedMessages: Key[];
+}
+
 export class LastMessage {
   key: Key;
   messageTimestamp?: number;
@@ -132,4 +136,13 @@ export class FetchBulkHistoryDto {
   batchSize?: number;
   autoResume?: boolean;
   resetProgress?: boolean;
+}
+
+export class DecryptPollVoteDto {
+  message: {
+    key: {
+      id: string;
+    };
+  };
+  remoteJid: string;
 }
