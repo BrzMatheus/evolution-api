@@ -528,7 +528,6 @@ export class BaileysStartupService extends ChannelStartupService {
         instanceName: this.instance.name,
       });
 
-
       if (shouldReconnect) {
         // Add 3 second delay before reconnection to prevent rapid reconnection loops
         this.logger.info('Reconnecting in 3 seconds...');
